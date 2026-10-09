@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Simple-Jukebox
+Comment=Music library manager and player
+Exec=/opt/simple-jukebox/Simple-Jukebox
+Icon=simple-jukebox
+Terminal=false
+Categories=AudioVideo;Audio;Player;

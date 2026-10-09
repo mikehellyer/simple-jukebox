@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-jukebox"
+version = "0.1.0"
+description = "A simple music library manager and player"
+authors = [{ name = "Mike Hellyer" }]
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6",
+    "platformdirs",
+    "certifi",
+    "mutagen",
+]
+
+[project.scripts]
+simple-jukebox = "simple_jukebox.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"simple_jukebox.gui" = ["resources/*.png"]
