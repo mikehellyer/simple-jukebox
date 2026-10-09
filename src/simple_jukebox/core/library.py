@@ -44,6 +44,20 @@ CREATE TABLE IF NOT EXISTS tracks (
 );
 CREATE INDEX IF NOT EXISTS idx_tracks_album_artist ON tracks(album_artist);
 CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album);
+CREATE TABLE IF NOT EXISTS playlists (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    created REAL NOT NULL
+);
+-- A track can appear in a playlist more than once, so entries are keyed
+-- by position rather than (playlist, track). Deleting a track from the
+-- library (its file is gone) drops it from every playlist.
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    PRIMARY KEY (playlist_id, position)
+);
 """
 
 # Album order: by disc, then track number, then title for untagged files.
@@ -67,6 +81,13 @@ class Track:
     play_count: int
     last_played: Optional[float]
     rating: int
+
+
+@dataclass
+class Playlist:
+    id: int
+    name: str
+    track_count: int
 
 
 @dataclass
@@ -103,6 +124,9 @@ class Library:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.row_factory = sqlite3.Row
+        # Off by default in SQLite, and per-connection — needed for the
+        # playlist ON DELETE CASCADE rules.
+        self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -264,6 +288,19 @@ class Library:
         row = self._conn.execute(f"SELECT {_TRACK_COLUMNS} FROM tracks WHERE id = ?", (track_id,)).fetchone()
         return Track(**dict(row)) if row else None
 
+    def tracks_by_ids(self, track_ids: Iterable[int]) -> dict[int, Track]:
+        """Look up many tracks at once (e.g. a long Up Next list)."""
+        unique = list(dict.fromkeys(track_ids))
+        found: dict[int, Track] = {}
+        # SQLite caps the number of ? parameters per statement.
+        for start in range(0, len(unique), 500):
+            chunk = unique[start:start + 500]
+            placeholders = ", ".join("?" * len(chunk))
+            rows = self._conn.execute(f"SELECT {_TRACK_COLUMNS} FROM tracks WHERE id IN ({placeholders})", chunk)
+            for row in rows:
+                found[row["id"]] = Track(**dict(row))
+        return found
+
     # --- stats ----------------------------------------------------------
 
     def record_play(self, track_id: int, when: Optional[float] = None) -> None:
@@ -278,3 +315,74 @@ class Library:
             "UPDATE tracks SET rating = ? WHERE id = ?", (max(0, min(5, int(rating))), track_id)
         )
         self._conn.commit()
+
+    # --- playlists ------------------------------------------------------
+
+    def playlists(self) -> list[Playlist]:
+        rows = self._conn.execute(
+            "SELECT p.id, p.name, COUNT(pt.track_id) FROM playlists p "
+            "LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+            "GROUP BY p.id ORDER BY p.name COLLATE NOCASE, p.id"
+        )
+        return [Playlist(id=row[0], name=row[1], track_count=row[2]) for row in rows]
+
+    def create_playlist(self, name: str) -> int:
+        cursor = self._conn.execute(
+            "INSERT INTO playlists (name, created) VALUES (?, ?)", (name.strip() or "Untitled Playlist", time.time())
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def rename_playlist(self, playlist_id: int, name: str) -> None:
+        if name.strip():
+            self._conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (name.strip(), playlist_id))
+            self._conn.commit()
+
+    def delete_playlist(self, playlist_id: int) -> None:
+        self._conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+        self._conn.commit()
+
+    def playlist_tracks(self, playlist_id: int) -> list[Track]:
+        columns = ", ".join(f"t.{c.strip()}" for c in _TRACK_COLUMNS.split(","))
+        rows = self._conn.execute(
+            f"SELECT {columns} FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
+            "WHERE pt.playlist_id = ? ORDER BY pt.position",
+            (playlist_id,),
+        )
+        return [Track(**dict(row)) for row in rows]
+
+    def _playlist_track_ids(self, playlist_id: int) -> list[int]:
+        rows = self._conn.execute(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position", (playlist_id,)
+        )
+        return [row[0] for row in rows]
+
+    def set_playlist_tracks(self, playlist_id: int, track_ids: list[int]) -> None:
+        """Replace a playlist's contents (positions are renumbered 0..n-1)."""
+        self._conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
+        self._conn.executemany(
+            "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?, ?, ?)",
+            [(playlist_id, position, track_id) for position, track_id in enumerate(track_ids)],
+        )
+        self._conn.commit()
+
+    def add_to_playlist(self, playlist_id: int, track_ids: list[int]) -> None:
+        self.set_playlist_tracks(playlist_id, self._playlist_track_ids(playlist_id) + list(track_ids))
+
+    def remove_from_playlist(self, playlist_id: int, positions: Iterable[int]) -> None:
+        """Remove entries by their position in the playlist (0-based)."""
+        drop = set(positions)
+        kept = [tid for pos, tid in enumerate(self._playlist_track_ids(playlist_id)) if pos not in drop]
+        self.set_playlist_tracks(playlist_id, kept)
+
+    def move_in_playlist(self, playlist_id: int, positions: list[int], to_position: int) -> None:
+        """Move the entries at positions (kept in their relative order) so
+        the first lands at to_position — counted in the playlist as it was
+        before the move, like a drag-and-drop insertion point."""
+        track_ids = self._playlist_track_ids(playlist_id)
+        moving_positions = sorted(p for p in set(positions) if 0 <= p < len(track_ids))
+        moving = [track_ids[p] for p in moving_positions]
+        insert_at = to_position - sum(1 for p in moving_positions if p < to_position)
+        rest = [tid for pos, tid in enumerate(track_ids) if pos not in set(moving_positions)]
+        insert_at = max(0, min(insert_at, len(rest)))
+        self.set_playlist_tracks(playlist_id, rest[:insert_at] + moving + rest[insert_at:])

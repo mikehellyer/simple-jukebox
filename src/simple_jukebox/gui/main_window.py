@@ -4,20 +4,23 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtCore import QItemSelectionModel, QObject, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -39,7 +42,9 @@ from simple_jukebox.core.self_update import (
 from simple_jukebox.core.settings import SettingsStore
 from simple_jukebox.core.updater import API_TIMEOUT_SECONDS, check_for_update
 from simple_jukebox.gui.player_bar import PlayerBar
+from simple_jukebox.gui.source_list import KIND_LIBRARY, KIND_PLAYLIST, SourceList
 from simple_jukebox.gui.track_model import COLUMNS, RATING_COLUMN, TrackTableModel
+from simple_jukebox.gui.up_next_panel import UpNextPanel
 from simple_jukebox.gui.update_banner import UpdateBanner
 
 UPDATE_OWNER = "mikehellyer"
@@ -116,6 +121,7 @@ class MainWindow(QMainWindow):
         self._background_threads: list[QThread] = []
         self._background_workers: list[_CallableWorker] = []
         self._pending_update = None
+        self._closing = False
 
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
@@ -133,6 +139,7 @@ class MainWindow(QMainWindow):
         self._player_bar.set_shuffle(self._settings.shuffle)
         self._player_bar.set_repeat(self._settings.repeat)
 
+        self._refresh_playlists()
         self._refresh_browser()
         if self._settings.music_folders:
             self._start_scan()
@@ -172,16 +179,28 @@ class MainWindow(QMainWindow):
         self._search_timer.timeout.connect(self._refresh_tracks)
         self._search.textChanged.connect(lambda _text: self._search_timer.start())
         top_row.addWidget(self._search)
+        self._up_next_button = QPushButton("☰ Up Next")
+        self._up_next_button.setCheckable(True)
+        top_row.addWidget(self._up_next_button)
         layout.addLayout(top_row)
 
         # Left: library sources. Right: artist/album column browser above
         # the track list, iTunes-style.
-        self._sources = QListWidget()
-        self._sources.setMaximumWidth(200)
-        for name in (SOURCE_ALL, SOURCE_RECENT, SOURCE_MOST_PLAYED):
-            self._sources.addItem(name)
-        self._sources.setCurrentRow(0)
+        self._sources = SourceList([SOURCE_ALL, SOURCE_RECENT, SOURCE_MOST_PLAYED])
         self._sources.currentRowChanged.connect(self._on_source_changed)
+        self._sources.tracks_dropped_on_playlist.connect(self._add_to_playlist)
+        self._sources.itemDoubleClicked.connect(lambda _item: self._play_source())
+        self._sources.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._sources.customContextMenuRequested.connect(self._show_source_menu)
+        new_playlist_button = QPushButton("＋ New Playlist")
+        new_playlist_button.setFlat(True)
+        new_playlist_button.clicked.connect(lambda: self._new_playlist())
+        sidebar = QWidget()
+        sidebar.setMaximumWidth(220)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 4)
+        sidebar_layout.addWidget(self._sources, stretch=1)
+        sidebar_layout.addWidget(new_playlist_button)
 
         self._artists = QListWidget()
         self._artists.currentItemChanged.connect(self._on_artist_changed)
@@ -201,6 +220,17 @@ class MainWindow(QMainWindow):
         self._table.setSortingEnabled(True)
         self._table.sortByColumn(-1, Qt.AscendingOrder)  # library order until a header is clicked
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._table.setDragEnabled(True)
+        self._table.setDragDropMode(QAbstractItemView.DragDrop)
+        self._table.setDefaultDropAction(Qt.MoveAction)
+        self._table.setDropIndicatorShown(True)
+        self._model.rows_moved.connect(self._on_playlist_rows_moved)
+        self._table.horizontalHeader().sortIndicatorChanged.connect(lambda *_: self._update_reorderable())
+        for key in (QKeySequence.Delete, QKeySequence(Qt.Key_Backspace)):
+            shortcut = QShortcut(key, self._table)
+            shortcut.setContext(Qt.WidgetShortcut)
+            shortcut.activated.connect(self._remove_selected_from_playlist)
         self._table.setAlternatingRowColors(True)
         self._table.setShowGrid(False)
         self._table.verticalHeader().hide()
@@ -213,6 +243,9 @@ class MainWindow(QMainWindow):
         for column, width in enumerate((24, 40, 280, 180, 220, 56, 110, 60, 50, 80)):
             header.resizeSection(column, width)
         header.setStretchLastSection(True)
+        # Clicking a header cycles ascending → descending → back to the
+        # list's own order (album order, or a playlist's running order).
+        header.setSortIndicatorClearable(True)
 
         self._empty_state = self._build_empty_state()
         self._track_stack = QStackedWidget()
@@ -225,12 +258,29 @@ class MainWindow(QMainWindow):
         right.setSizes([200, 520])
 
         main_split = QSplitter(Qt.Horizontal)
-        main_split.addWidget(self._sources)
+        main_split.addWidget(sidebar)
         main_split.addWidget(right)
         main_split.setSizes([180, 1100])
         layout.addWidget(main_split, stretch=1)
 
         self.setCentralWidget(central)
+
+        self._up_next = UpNextPanel()
+        self._up_next.jump_requested.connect(self._jump_in_queue)
+        self._up_next.remove_requested.connect(lambda offset: self._edit_queue(self._queue.remove_upcoming, offset))
+        self._up_next.move_requested.connect(lambda a, b: self._edit_queue(self._queue.move_upcoming, a, b))
+        self._up_next.tracks_dropped.connect(self._on_tracks_dropped_on_up_next)
+        self._up_next.clear_requested.connect(lambda: self._edit_queue(self._queue.clear_upcoming))
+        self._up_next_dock = QDockWidget("Up Next", self)
+        self._up_next_dock.setObjectName("up-next")
+        self._up_next_dock.setWidget(self._up_next)
+        self._up_next_dock.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable)
+        self._up_next_dock.setMinimumWidth(240)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._up_next_dock)
+        self._up_next_dock.setVisible(self._settings.show_up_next)
+        self._up_next_button.setChecked(self._settings.show_up_next)
+        self._up_next_button.toggled.connect(self._up_next_dock.setVisible)
+        self._up_next_dock.visibilityChanged.connect(self._on_up_next_visibility)
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
@@ -276,6 +326,12 @@ class MainWindow(QMainWindow):
         self._remove_folder_menu = file_menu.addMenu("&Remove Music Folder")
         self._remove_folder_menu.aboutToShow.connect(self._populate_remove_folder_menu)
 
+        new_playlist_action = QAction("&New Playlist…", self)
+        new_playlist_action.setShortcut(QKeySequence.New)
+        new_playlist_action.triggered.connect(lambda: self._new_playlist())
+        file_menu.addAction(new_playlist_action)
+        file_menu.addSeparator()
+
         rescan_action = QAction("Re&scan Library", self)
         rescan_action.setShortcut(QKeySequence("F5"))
         rescan_action.triggered.connect(self._start_scan)
@@ -286,6 +342,15 @@ class MainWindow(QMainWindow):
         quit_action.setShortcut(QKeySequence.Quit)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
+
+        view_menu = self.menuBar().addMenu("&View")
+        toggle_up_next = QAction("Show &Up Next", self)
+        toggle_up_next.setCheckable(True)
+        toggle_up_next.setShortcut(QKeySequence("Ctrl+U"))
+        toggle_up_next.setChecked(self._settings.show_up_next)
+        toggle_up_next.toggled.connect(self._up_next_dock.setVisible)
+        self._up_next_dock.visibilityChanged.connect(toggle_up_next.setChecked)
+        view_menu.addAction(toggle_up_next)
 
         controls = self.menuBar().addMenu("&Controls")
         for text, shortcut, slot in (
@@ -392,9 +457,12 @@ class MainWindow(QMainWindow):
 
     # --- browsing -------------------------------------------------------
 
-    def _source(self) -> str:
-        item = self._sources.currentItem()
-        return item.text() if item else SOURCE_ALL
+    def _source(self) -> tuple[str, object]:
+        return self._sources.current_source() or (KIND_LIBRARY, SOURCE_ALL)
+
+    def _playlist_id(self) -> Optional[int]:
+        kind, value = self._source()
+        return value if kind == KIND_PLAYLIST else None
 
     def _selected(self, widget: QListWidget, all_label: str) -> Optional[str]:
         item = widget.currentItem()
@@ -441,7 +509,11 @@ class MainWindow(QMainWindow):
         self._refresh_tracks()
 
     def _on_source_changed(self, _row: int) -> None:
-        self._browser.setVisible(self._source() == SOURCE_ALL)
+        self._browser.setVisible(self._source() == (KIND_LIBRARY, SOURCE_ALL))
+        # Playlists open in their own order, not whatever column the
+        # library was last sorted by.
+        if self._playlist_id() is not None:
+            self._table.sortByColumn(-1, Qt.AscendingOrder)
         self._refresh_tracks()
 
     def _on_artist_changed(self, *_args) -> None:
@@ -449,8 +521,10 @@ class MainWindow(QMainWindow):
         self._refresh_albums()
 
     def _refresh_tracks(self) -> None:
-        source = self._source()
-        if source == SOURCE_RECENT:
+        kind, source = self._source()
+        if kind == KIND_PLAYLIST:
+            tracks = self._library.playlist_tracks(source)
+        elif source == SOURCE_RECENT:
             tracks = self._library.recently_added()
         elif source == SOURCE_MOST_PLAYED:
             tracks = self._library.most_played()
@@ -465,15 +539,18 @@ class MainWindow(QMainWindow):
                 search=self._search.text(),
             )
         search = self._search.text().lower().split()
-        if source != SOURCE_ALL and search:
+        if (kind, source) != (KIND_LIBRARY, SOURCE_ALL) and search:
             tracks = [
                 t for t in tracks
                 if all(w in f"{t.title} {t.artist} {t.album} {t.genre}".lower() for w in search)
             ]
         self._model.set_tracks(tracks)
         self._model.set_playing(self._current.id if self._current else None)
+        self._update_reorderable()
 
         total = self._library.track_count()
+        # A playlist can legitimately be empty — only the library as a
+        # whole being empty gets the "add a folder" screen.
         self._track_stack.setCurrentWidget(self._table if total else self._empty_state)
         seconds = sum(t.duration for t in tracks)
         hours = seconds / 3600
@@ -487,22 +564,164 @@ class MainWindow(QMainWindow):
             for row in range(self._proxy.rowCount())
         ]
 
+    def _selected_tracks(self) -> list[tuple[int, Track]]:
+        """(source row, track) for each selected row, in on-screen order.
+        In a playlist view the source row is the entry's playlist position."""
+        proxy_rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
+        selected = []
+        for proxy_row in proxy_rows:
+            source_row = self._proxy.mapToSource(self._proxy.index(proxy_row, 0)).row()
+            selected.append((source_row, self._model.track_at(source_row)))
+        return selected
+
     def _show_track_menu(self, pos) -> None:
         index = self._table.indexAt(pos)
         if not index.isValid():
             return
-        track = self._model.track_at(self._proxy.mapToSource(index).row())
+        selection = self._table.selectionModel()
+        if not selection.isRowSelected(index.row(), index.parent()):
+            self._table.selectRow(index.row())
+        selected = self._selected_tracks()
+        track_ids = [track.id for _, track in selected]
+        first = selected[0][1]
+
         menu = QMenu(self)
         menu.addAction("Play", lambda: self._on_track_activated(index))
+        menu.addAction("Play Next", lambda: self._queue_tracks(track_ids, play_next=True))
+        menu.addAction("Add to Up Next", lambda: self._queue_tracks(track_ids, play_next=False))
+        menu.addSeparator()
+
+        playlist_menu = menu.addMenu("Add to Playlist")
+        playlist_menu.addAction("New Playlist…", lambda: self._new_playlist(track_ids))
+        playlists = self._library.playlists()
+        if playlists:
+            playlist_menu.addSeparator()
+        for playlist in playlists:
+            playlist_menu.addAction(
+                playlist.name, lambda pid=playlist.id: self._add_to_playlist(pid, track_ids)
+            )
+        if self._playlist_id() is not None:
+            menu.addAction("Remove from Playlist", self._remove_selected_from_playlist)
+        menu.addSeparator()
+
         rating_menu = menu.addMenu("Rating")
         for stars in range(6):
             label = "★" * stars if stars else "None"
-            rating_menu.addAction(label, lambda s=stars: self._rate(track, s))
+            rating_menu.addAction(label, lambda s=stars: [self._rate(track, s) for _, track in selected])
         menu.addAction(
             "Show in Folder",
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(track.path).parent))),
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(first.path).parent))),
         )
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    # --- playlists ------------------------------------------------------
+
+    def _refresh_playlists(self) -> None:
+        self._sources.blockSignals(True)
+        self._sources.set_playlists(self._library.playlists())
+        self._sources.blockSignals(False)
+
+    def _new_playlist(self, track_ids: Optional[list[int]] = None) -> None:
+        name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:", text="Untitled Playlist")
+        if not ok:
+            return
+        playlist_id = self._library.create_playlist(name)
+        if track_ids:
+            self._library.add_to_playlist(playlist_id, track_ids)
+        self._refresh_playlists()
+        if not track_ids:
+            # An empty playlist: open it, ready to drag songs onto it.
+            self._sources.select_source(KIND_PLAYLIST, playlist_id)
+
+    def _add_to_playlist(self, playlist_id: int, track_ids: list[int]) -> None:
+        self._library.add_to_playlist(playlist_id, track_ids)
+        self._refresh_playlists()
+        name = next((p.name for p in self._library.playlists() if p.id == playlist_id), "playlist")
+        count = len(track_ids)
+        self._status.showMessage(f"Added {count} song{'s' if count != 1 else ''} to {name}", 4000)
+        if self._playlist_id() == playlist_id:
+            self._refresh_tracks()
+
+    def _remove_selected_from_playlist(self) -> None:
+        playlist_id = self._playlist_id()
+        if playlist_id is None:
+            return
+        positions = [row for row, _ in self._selected_tracks()]
+        if not positions:
+            return
+        self._library.remove_from_playlist(playlist_id, positions)
+        self._refresh_playlists()
+        self._refresh_tracks()
+
+    def _update_reorderable(self) -> None:
+        """Drag-to-reorder only makes sense in a playlist shown in its own
+        order — not when sorted by a column, or while searching."""
+        self._model.reorderable = (
+            self._playlist_id() is not None
+            and self._table.horizontalHeader().sortIndicatorSection() == -1
+            and not self._search.text().strip()
+        )
+
+    def _on_playlist_rows_moved(self, rows: list, to_row: int) -> None:
+        playlist_id = self._playlist_id()
+        if playlist_id is None:
+            return
+        self._library.move_in_playlist(playlist_id, rows, to_row)
+        self._refresh_tracks()
+        # Keep the moved songs selected where they landed.
+        insert_at = to_row - sum(1 for r in rows if r < to_row)
+        self._table.clearSelection()
+        for row in range(insert_at, insert_at + len(rows)):
+            self._table.selectionModel().select(
+                self._proxy.index(row, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+
+    def _show_source_menu(self, pos) -> None:
+        playlist_id = self._sources.playlist_at(pos)
+        if playlist_id is None:
+            return
+        playlist = next((p for p in self._library.playlists() if p.id == playlist_id), None)
+        if playlist is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Play", lambda: self._play_playlist(playlist_id))
+        menu.addAction("Add to Up Next", lambda: self._queue_tracks(
+            [t.id for t in self._library.playlist_tracks(playlist_id)], play_next=False))
+        menu.addSeparator()
+        menu.addAction("Rename…", lambda: self._rename_playlist(playlist))
+        menu.addAction("Delete", lambda: self._delete_playlist(playlist))
+        menu.exec(self._sources.viewport().mapToGlobal(pos))
+
+    def _rename_playlist(self, playlist) -> None:
+        name, ok = QInputDialog.getText(self, "Rename Playlist", "Playlist name:", text=playlist.name)
+        if ok:
+            self._library.rename_playlist(playlist.id, name)
+            self._refresh_playlists()
+
+    def _delete_playlist(self, playlist) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Delete Playlist",
+            f"Delete the playlist “{playlist.name}”?\nThe songs stay in your library.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        was_open = self._playlist_id() == playlist.id
+        self._library.delete_playlist(playlist.id)
+        self._refresh_playlists()
+        if was_open:
+            self._sources.select_source(KIND_LIBRARY, SOURCE_ALL)
+
+    def _play_playlist(self, playlist_id: int) -> None:
+        track_ids = [t.id for t in self._library.playlist_tracks(playlist_id)]
+        if track_ids:
+            self._play_track_id(self._queue.load(track_ids))
+
+    def _play_source(self) -> None:
+        playlist_id = self._playlist_id()
+        if playlist_id is not None:
+            self._play_playlist(playlist_id)
 
     def _rate(self, track: Track, stars: int) -> None:
         self._library.set_rating(track.id, stars)
@@ -517,6 +736,46 @@ class MainWindow(QMainWindow):
         tracks = self._visible_tracks()
         track_id = self._queue.load([t.id for t in tracks], start_index=row)
         self._play_track_id(track_id)
+
+    def _queue_tracks(self, track_ids: list[int], play_next: bool) -> None:
+        if play_next:
+            self._queue.play_next(track_ids)
+        else:
+            self._queue.add(track_ids)
+        self._refresh_up_next()
+        count = len(track_ids)
+        where = "to play next" if play_next else "to Up Next"
+        self._status.showMessage(f"Queued {count} song{'s' if count != 1 else ''} {where}", 4000)
+
+    def _on_tracks_dropped_on_up_next(self, track_ids: list, offset: int) -> None:
+        self._queue.add(track_ids)
+        # add() puts them at the end; slide each into place in order.
+        upcoming = len(self._queue.upcoming())
+        for i in range(len(track_ids)):
+            self._queue.move_upcoming(upcoming - len(track_ids) + i, offset + i)
+        self._refresh_up_next()
+
+    def _edit_queue(self, edit, *args) -> None:
+        edit(*args)
+        self._refresh_up_next()
+
+    def _jump_in_queue(self, offset: int) -> None:
+        self._play_track_id(self._queue.jump_to(offset))
+
+    def _refresh_up_next(self) -> None:
+        upcoming_ids = self._queue.upcoming()
+        found = self._library.tracks_by_ids(upcoming_ids[:500])
+        upcoming = [found.get(track_id) for track_id in upcoming_ids[:500]]
+        # Only the shown head needs real Track objects; the rest is counted.
+        upcoming += [None] * (len(upcoming_ids) - len(upcoming))
+        self._up_next.set_queue(self._current, upcoming)
+
+    def _on_up_next_visibility(self, visible: bool) -> None:
+        self._up_next_button.setChecked(visible)
+        # visibilityChanged also fires when the window is minimised —
+        # only remember real show/hide choices.
+        if not self._closing and not self.isMinimized() and self.isVisible():
+            self._settings.set_show_up_next(visible)
 
     def _play_track_id(self, track_id: Optional[int]) -> None:
         if track_id is None:
@@ -536,12 +795,16 @@ class MainWindow(QMainWindow):
         self._player_bar.set_now_playing(track.title, subtitle)
         self._player_bar.set_art(find_art(Path(track.path)))
         self._model.set_playing(track.id)
+        self._refresh_up_next()
         self.setWindowTitle(f"{track.title} — {track.artist} · Simple-Jukebox")
 
     def _toggle_play_pause(self) -> None:
         if self._focus_is_text_entry():
             return
         if self._current is None:
+            if self._queue.upcoming():
+                self._play_next(user_requested=True)
+                return
             tracks = self._visible_tracks()
             if tracks:
                 selected = self._table.currentIndex()
@@ -572,6 +835,7 @@ class MainWindow(QMainWindow):
         self._current = None
         self._player_bar.set_active(False)
         self._model.set_playing(None)
+        self._refresh_up_next()
         self.setWindowTitle(f"Simple-Jukebox v{__version__}")
 
     def _on_position_changed(self, position_ms: int) -> None:
@@ -607,10 +871,12 @@ class MainWindow(QMainWindow):
     def _on_shuffle_toggled(self, shuffle: bool) -> None:
         self._queue.set_shuffle(shuffle)
         self._settings.set_shuffle(shuffle)
+        self._refresh_up_next()
 
     def _on_repeat_changed(self, repeat: str) -> None:
         self._queue.repeat = repeat
         self._settings.set_repeat(repeat)
+        self._refresh_up_next()
 
     # --- updates --------------------------------------------------------
 
@@ -676,6 +942,7 @@ class MainWindow(QMainWindow):
         self._update_banner.set_busy(False)
 
     def closeEvent(self, event) -> None:
+        self._closing = True
         self._player.stop()
         for thread in list(self._background_threads):
             thread.quit()

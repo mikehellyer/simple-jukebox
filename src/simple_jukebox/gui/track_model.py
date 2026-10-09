@@ -1,9 +1,10 @@
 """Table model behind the main track list."""
 from __future__ import annotations
 
+import json
 from typing import Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractTableModel, QMimeData, QModelIndex, Qt, Signal
 from PySide6.QtGui import QFont
 
 from simple_jukebox.core.library import Track
@@ -14,12 +15,39 @@ NOW_PLAYING_COLUMN = 0
 RATING_COLUMN = 9
 PLAYING_MARK = "▶"
 
+# Dragged tracks carry their ids (for dropping on a playlist or Up Next)
+# and their rows (for reordering within the playlist being viewed).
+TRACKS_MIME = "application/x-simple-jukebox-tracks"
+
+
+def encode_tracks(track_ids: list[int], rows: list[int]) -> QMimeData:
+    mime = QMimeData()
+    mime.setData(TRACKS_MIME, json.dumps({"ids": track_ids, "rows": rows}).encode("utf-8"))
+    return mime
+
+
+def decode_tracks(mime: QMimeData) -> Optional[dict]:
+    if not mime.hasFormat(TRACKS_MIME):
+        return None
+    try:
+        payload = json.loads(bytes(mime.data(TRACKS_MIME)).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("ids"), list):
+        return None
+    return payload
+
 
 class TrackTableModel(QAbstractTableModel):
+    # Rows dropped back onto this table — only accepted while showing a
+    # playlist, where it means "reorder": (moved rows, insertion row).
+    rows_moved = Signal(list, int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tracks: list[Track] = []
         self._playing_id: Optional[int] = None
+        self.reorderable = False
 
     def set_tracks(self, tracks: list[Track]) -> None:
         self.beginResetModel()
@@ -43,6 +71,39 @@ class TrackTableModel(QAbstractTableModel):
         self._playing_id = track_id
         if self._tracks:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self._tracks) - 1, len(COLUMNS) - 1))
+
+    def flags(self, index):
+        base = super().flags(index)
+        if index.isValid():
+            return base | Qt.ItemIsDragEnabled
+        return base | Qt.ItemIsDropEnabled if self.reorderable else base
+
+    def supportedDragActions(self):
+        return Qt.CopyAction | Qt.MoveAction
+
+    def supportedDropActions(self):
+        return Qt.MoveAction
+
+    def mimeTypes(self) -> list[str]:
+        return [TRACKS_MIME]
+
+    def mimeData(self, indexes) -> QMimeData:
+        rows = sorted({index.row() for index in indexes if index.isValid()})
+        return encode_tracks([self._tracks[row].id for row in rows], rows)
+
+    def canDropMimeData(self, data, action, row, column, parent) -> bool:
+        return self.reorderable and data.hasFormat(TRACKS_MIME)
+
+    def dropMimeData(self, data, action, row, column, parent) -> bool:
+        payload = decode_tracks(data)
+        if not self.reorderable or payload is None or not payload.get("rows"):
+            return False
+        if row < 0:
+            row = parent.row() if parent.isValid() else len(self._tracks)
+        self.rows_moved.emit(list(payload["rows"]), row)
+        # The window reloads the playlist itself; returning False stops
+        # the view trying to delete the "moved" source rows afterwards.
+        return False
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._tracks)

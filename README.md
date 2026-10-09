@@ -18,6 +18,17 @@ play counts, star ratings, and embedded or folder (`cover.jpg`) album art
 are all supported. Rescans are incremental, so re-opening a big library is
 quick.
 
+**Playlists** live in the sidebar: make one with **File ▸ New Playlist…**
+(or "Add to Playlist ▸ New Playlist…" on selected songs), then drag songs
+onto it. Inside a playlist, drag rows to reorder them and press Delete to
+remove them. Right-click a playlist to play, rename, or delete it.
+
+**Up Next** (the panel on the right, **View ▸ Show Up Next** / Ctrl+U)
+shows what's playing and what follows. Right-click songs and choose **Play
+Next** or **Add to Up Next**, or drag them into the panel. Within the
+panel, drag to reorder, double-click to jump ahead, and press Delete to
+remove a song.
+
 ## Development setup
 
 ```bash
@@ -41,8 +52,8 @@ pytest
 
 ## Project layout
 
-- `src/simple_jukebox/core/` — tag reading, the SQLite library, the play
-  queue, settings, and the update checker; plain Python, no Qt dependency,
+- `src/simple_jukebox/core/` — tag reading, the SQLite library (tracks
+  and playlists), the Up Next play queue, settings, and the update checker; plain Python, no Qt dependency,
   covered by `tests/`.
 - `src/simple_jukebox/gui/` — the PySide6 window and widgets.
 - `src/simple_jukebox/app.py` — entry point.

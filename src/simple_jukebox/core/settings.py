@@ -1,5 +1,6 @@
 """Persisted user preferences: which folders make up the library, plus
-playback state worth remembering between runs (volume, shuffle, repeat).
+playback and layout state worth remembering between runs (volume,
+shuffle, repeat, whether the Up Next panel is showing).
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ class Settings:
     volume: int = 80
     shuffle: bool = False
     repeat: str = "off"
+    show_up_next: bool = True
 
 
 class SettingsStore:
@@ -75,6 +77,14 @@ class SettingsStore:
             self._settings.repeat = repeat
             self.save()
 
+    @property
+    def show_up_next(self) -> bool:
+        return self._settings.show_up_next
+
+    def set_show_up_next(self, show: bool) -> None:
+        self._settings.show_up_next = show
+        self.save()
+
     def load(self) -> None:
         if not self._config_path.exists():
             return
@@ -91,6 +101,8 @@ class SettingsStore:
             self._settings.volume = max(0, min(100, data["volume"]))
         if isinstance(data.get("shuffle"), bool):
             self._settings.shuffle = data["shuffle"]
+        if isinstance(data.get("show_up_next"), bool):
+            self._settings.show_up_next = data["show_up_next"]
         if data.get("repeat") in REPEAT_MODES:
             self._settings.repeat = data["repeat"]
 

@@ -97,3 +97,60 @@ def test_remove_folder_forgets_its_tracks(tmp_path):
     library, music, _ = _library_with_files(tmp_path)
     assert library.remove_folder(str(music)) == 3
     assert library.track_count() == 0
+
+
+def test_playlists_keep_order_and_duplicates(tmp_path):
+    library, _, _ = _library_with_files(tmp_path)
+    ids = {t.title: t.id for t in library.tracks()}
+    playlist = library.create_playlist("  Road Trip  ")
+    library.add_to_playlist(playlist, [ids["Encore"], ids["Song A"], ids["Encore"]])
+
+    assert [p.name for p in library.playlists()] == ["Road Trip"]
+    assert library.playlists()[0].track_count == 3
+    assert [t.title for t in library.playlist_tracks(playlist)] == ["Encore", "Song A", "Encore"]
+
+    library.remove_from_playlist(playlist, [0])
+    assert [t.title for t in library.playlist_tracks(playlist)] == ["Song A", "Encore"]
+
+
+def test_move_in_playlist_behaves_like_drag_and_drop(tmp_path):
+    library, _, _ = _library_with_files(tmp_path)
+    ids = {t.title: t.id for t in library.tracks()}
+    playlist = library.create_playlist("Mix")
+    library.add_to_playlist(playlist, [ids["Song A"], ids["Song B"], ids["Encore"]])
+
+    library.move_in_playlist(playlist, [0], 3)  # drag first to the end
+    assert [t.title for t in library.playlist_tracks(playlist)] == ["Song B", "Encore", "Song A"]
+    library.move_in_playlist(playlist, [1, 2], 0)  # drag last two to the top
+    assert [t.title for t in library.playlist_tracks(playlist)] == ["Encore", "Song A", "Song B"]
+
+
+def test_deleted_files_drop_out_of_playlists(tmp_path):
+    library, music, _ = _library_with_files(tmp_path)
+    ids = {t.title: t.id for t in library.tracks()}
+    playlist = library.create_playlist("Mix")
+    library.add_to_playlist(playlist, [ids["Encore"], ids["Song A"]])
+
+    (music / "b1.flac").unlink()
+    library.scan([str(music)], read=_fake_reader(TAGS))
+
+    assert [t.title for t in library.playlist_tracks(playlist)] == ["Song A"]
+
+
+def test_rename_and_delete_playlist(tmp_path):
+    library, _, _ = _library_with_files(tmp_path)
+    playlist = library.create_playlist("Old")
+    library.add_to_playlist(playlist, [library.tracks()[0].id])
+    library.rename_playlist(playlist, "New")
+    library.rename_playlist(playlist, "   ")  # ignored
+    assert library.playlists()[0].name == "New"
+    library.delete_playlist(playlist)
+    assert library.playlists() == []
+    assert library.track_count() == 3
+
+
+def test_tracks_by_ids_skips_unknown_ids(tmp_path):
+    library, _, _ = _library_with_files(tmp_path)
+    ids = [t.id for t in library.tracks()]
+    found = library.tracks_by_ids(ids + [9999])
+    assert sorted(found) == sorted(ids)
