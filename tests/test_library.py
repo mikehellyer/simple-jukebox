@@ -161,3 +161,15 @@ def test_already_in_playlist_finds_existing_and_repeated_songs():
 
     assert already_in_playlist([1, 2], [3, 2, 4, 3, 1]) == [1, 3, 4]
     assert already_in_playlist([], [5, 6]) == []
+
+
+def test_album_summaries_group_and_search(tmp_path):
+    library, _, _ = _library_with_files(tmp_path)
+    albums = library.album_summaries()
+    assert [(a.album_artist, a.album, a.track_count) for a in albums] == [
+        ("Alpha", "Debut", 2),
+        ("Beta", "Live", 1),
+    ]
+    assert albums[0].cover_path.endswith("a2.mp3")  # Song A is track 1
+    assert [a.album for a in library.album_summaries(search="encore")] == ["Live"]
+    assert [t.title for t in library.album_tracks("Alpha", "Debut")] == ["Song A", "Song B"]

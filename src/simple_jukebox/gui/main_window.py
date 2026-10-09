@@ -43,6 +43,7 @@ from simple_jukebox.core.self_update import (
 )
 from simple_jukebox.core.settings import SettingsStore
 from simple_jukebox.core.updater import API_TIMEOUT_SECONDS, check_for_update
+from simple_jukebox.gui.album_grid import AlbumGridModel, AlbumGridView
 from simple_jukebox.gui.player_bar import PlayerBar
 from simple_jukebox.gui.sync_dialog import SyncDialog
 from simple_jukebox.gui.source_list import KIND_LIBRARY, KIND_PLAYLIST, SourceList
@@ -56,6 +57,7 @@ BACKGROUND_JOIN_TIMEOUT_MS = (API_TIMEOUT_SECONDS + 1) * 1000
 ICON_PATH = Path(__file__).parent / "resources" / "icon.png"
 
 SOURCE_ALL = "All Music"
+SOURCE_ALBUMS = "Albums"
 SOURCE_RECENT = "Recently Added"
 SOURCE_MOST_PLAYED = "Most Played"
 ALL_ARTISTS = "All Artists"
@@ -180,7 +182,7 @@ class MainWindow(QMainWindow):
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
-        self._search_timer.timeout.connect(self._refresh_tracks)
+        self._search_timer.timeout.connect(self._on_search_changed)
         self._search.textChanged.connect(lambda _text: self._search_timer.start())
         top_row.addWidget(self._search)
         self._up_next_button = QPushButton("☰ Up Next")
@@ -190,7 +192,7 @@ class MainWindow(QMainWindow):
 
         # Left: library sources. Right: artist/album column browser above
         # the track list, iTunes-style.
-        self._sources = SourceList([SOURCE_ALL, SOURCE_RECENT, SOURCE_MOST_PLAYED])
+        self._sources = SourceList([SOURCE_ALL, SOURCE_ALBUMS, SOURCE_RECENT, SOURCE_MOST_PLAYED])
         self._sources.currentRowChanged.connect(self._on_source_changed)
         self._sources.tracks_dropped_on_playlist.connect(self._add_to_playlist)
         self._sources.itemDoubleClicked.connect(lambda _item: self._play_source())
@@ -256,10 +258,22 @@ class MainWindow(QMainWindow):
         self._track_stack.addWidget(self._table)
         self._track_stack.addWidget(self._empty_state)
 
+        # The album grid takes the browser's place (and more room) when
+        # "Albums" is chosen; picking an album lists its songs below.
+        self._album_model = AlbumGridModel(self._library, self)
+        self._album_grid = AlbumGridView()
+        self._album_grid.setModel(self._album_model)
+        self._album_grid.selectionModel().selectionChanged.connect(lambda *_: self._refresh_tracks())
+        self._album_grid.doubleClicked.connect(lambda index: self._play_albums([index.row()]))
+        self._album_grid.customContextMenuRequested.connect(self._show_album_menu)
+        self._album_grid.hide()
+
         right = QSplitter(Qt.Vertical)
         right.addWidget(browser)
+        right.addWidget(self._album_grid)
         right.addWidget(self._track_stack)
-        right.setSizes([200, 520])
+        right.setSizes([200, 0, 520])
+        self._right_split = right
 
         main_split = QSplitter(Qt.Horizontal)
         main_split.addWidget(sidebar)
@@ -428,6 +442,8 @@ class MainWindow(QMainWindow):
         removed = self._library.remove_folder(folder)
         self._status.showMessage(f"Removed {removed:,} tracks from the library", 5000)
         self._refresh_browser()
+        if self._album_grid.isVisible():
+            self._refresh_album_grid()
 
     def _start_scan(self) -> None:
         if self._scanning or not self._settings.music_folders:
@@ -463,7 +479,11 @@ class MainWindow(QMainWindow):
             f"{result.removed:,} removed",
             6000,
         )
+        if result.added or result.updated or result.removed:
+            self._album_model.forget_art()  # covers may have changed
         self._refresh_browser()
+        if self._album_grid.isVisible():
+            self._refresh_album_grid()
 
     # --- browsing -------------------------------------------------------
 
@@ -520,11 +540,94 @@ class MainWindow(QMainWindow):
 
     def _on_source_changed(self, _row: int) -> None:
         self._browser.setVisible(self._source() == (KIND_LIBRARY, SOURCE_ALL))
+        albums = self._source() == (KIND_LIBRARY, SOURCE_ALBUMS)
+        was_showing_albums = self._album_grid.isVisible()
+        self._album_grid.setVisible(albums)
+        if albums:
+            self._refresh_album_grid()
+            if not was_showing_albums:
+                total = sum(self._right_split.sizes())
+                self._right_split.setSizes([0, int(total * 0.62), int(total * 0.38)])
         # Playlists open in their own order, not whatever column the
         # library was last sorted by.
         if self._playlist_id() is not None:
             self._table.sortByColumn(-1, Qt.AscendingOrder)
         self._refresh_tracks()
+
+    def _on_search_changed(self) -> None:
+        if self._album_grid.isVisible():
+            self._refresh_album_grid()
+        self._refresh_tracks()
+
+    # --- album grid -----------------------------------------------------
+
+    def _refresh_album_grid(self) -> None:
+        """Repopulate the grid for the current search, keeping the
+        selected albums selected if they're still there."""
+        selected = {album.key for album in self._selected_albums()}
+        self._album_grid.selectionModel().blockSignals(True)
+        self._album_model.set_albums(self._library.album_summaries(self._search.text()))
+        selection = self._album_grid.selectionModel()
+        first = None
+        for key in selected:
+            row = self._album_model.row_of(key)
+            if row is not None:
+                index = self._album_model.index(row)
+                selection.select(index, QItemSelectionModel.Select)
+                first = index if first is None or row < first.row() else first
+        if first is not None:
+            selection.setCurrentIndex(first, QItemSelectionModel.NoUpdate)
+            self._album_grid.scrollTo(first)
+        self._album_grid.selectionModel().blockSignals(False)
+
+    def _selected_albums(self):
+        rows = sorted({index.row() for index in self._album_grid.selectionModel().selectedIndexes()})
+        return [album for album in (self._album_model.album_at(row) for row in rows) if album is not None]
+
+    def _album_track_ids(self, rows: list[int]) -> list[int]:
+        ids = []
+        for row in rows:
+            album = self._album_model.album_at(row)
+            if album is not None:
+                ids.extend(t.id for t in self._library.album_tracks(*album.key))
+        return ids
+
+    def _play_albums(self, rows: list[int]) -> None:
+        track_ids = self._album_track_ids(rows)
+        if track_ids:
+            self._play_track_id(self._queue.load(track_ids))
+
+    def _show_album_menu(self, pos) -> None:
+        index = self._album_grid.indexAt(pos)
+        if not index.isValid():
+            return
+        selection = self._album_grid.selectionModel()
+        if not selection.isSelected(index):
+            selection.select(index, QItemSelectionModel.ClearAndSelect)
+        rows = sorted({i.row() for i in selection.selectedIndexes()})
+        track_ids = self._album_track_ids(rows)
+        menu = QMenu(self)
+        menu.addAction("Play", lambda: self._play_albums(rows))
+        menu.addAction("Play Next", lambda: self._queue_tracks(track_ids, play_next=True))
+        menu.addAction("Add to Up Next", lambda: self._queue_tracks(track_ids, play_next=False))
+        menu.addSeparator()
+        playlist_menu = menu.addMenu("Add to Playlist")
+        playlist_menu.addAction("New Playlist…", lambda: self._new_playlist(track_ids))
+        playlists = self._library.playlists()
+        if playlists:
+            playlist_menu.addSeparator()
+        for playlist in playlists:
+            playlist_menu.addAction(
+                playlist.name, lambda pid=playlist.id: self._add_to_playlist(pid, track_ids)
+            )
+        if len(rows) == 1:
+            album = self._album_model.album_at(rows[0])
+            menu.addSeparator()
+            menu.addAction(
+                "Show in Folder",
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(album.cover_path).parent))),
+            )
+        menu.exec(self._album_grid.viewport().mapToGlobal(pos))
 
     def _on_artist_changed(self, *_args) -> None:
         self._albums.setCurrentRow(0)
@@ -538,6 +641,10 @@ class MainWindow(QMainWindow):
             tracks = self._library.recently_added()
         elif source == SOURCE_MOST_PLAYED:
             tracks = self._library.most_played()
+        elif source == SOURCE_ALBUMS:
+            tracks = []
+            for album in self._selected_albums():
+                tracks.extend(self._library.album_tracks(*album.key))
         else:
             album_item = self._albums.currentItem()
             album = None
@@ -1023,6 +1130,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        self._album_model.shutdown()
         self._player.stop()
         for thread in list(self._background_threads):
             thread.quit()

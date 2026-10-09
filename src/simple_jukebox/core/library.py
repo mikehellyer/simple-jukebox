@@ -91,6 +91,21 @@ class Playlist:
 
 
 @dataclass
+class AlbumSummary:
+    """One album as the grid shows it."""
+
+    album_artist: str
+    album: str
+    year: Optional[int]
+    track_count: int
+    cover_path: str  # its first track — where to look for cover art
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.album_artist, self.album
+
+
+@dataclass
 class ScanResult:
     added: int = 0
     updated: int = 0
@@ -281,6 +296,30 @@ class Library:
             sql += " WHERE " + " AND ".join(clauses)
         sql += f" ORDER BY {TRACK_ORDER}"
         return [Track(**dict(row)) for row in self._conn.execute(sql, params)]
+
+    def album_summaries(self, search: str = "") -> list[AlbumSummary]:
+        """Every album (optionally only those with a song matching search),
+        in artist, year, album order."""
+        summaries: dict[tuple[str, str], AlbumSummary] = {}
+        for track in self.tracks(search=search):
+            key = (track.album_artist, track.album)
+            summary = summaries.get(key)
+            if summary is None:
+                summaries[key] = AlbumSummary(
+                    album_artist=track.album_artist,
+                    album=track.album,
+                    year=track.year,
+                    track_count=1,
+                    cover_path=track.path,
+                )
+            else:
+                summary.track_count += 1
+                if track.year and (summary.year is None or track.year > summary.year):
+                    summary.year = track.year
+        return list(summaries.values())
+
+    def album_tracks(self, album_artist: str, album: str) -> list[Track]:
+        return self.tracks(artist=album_artist, album=album)
 
     def recently_added(self, limit: int = 200) -> list[Track]:
         rows = self._conn.execute(

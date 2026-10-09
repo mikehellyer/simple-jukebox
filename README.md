@@ -18,6 +18,13 @@ play counts, star ratings, and embedded or folder (`cover.jpg`) album art
 are all supported. Rescans are incremental, so re-opening a big library is
 quick.
 
+**Albums** (in the sidebar) shows the library as a grid of album covers, like
+Strawberry's album view. Click an album to list its songs below, double-click
+to play it, right-click to queue it or add it to a playlist, or drag it onto a
+playlist or the Up Next panel. The search box filters the grid. Covers come
+from the songs' embedded art or a `cover.jpg`/`folder.jpg` in the album
+folder, load in the background, and are cached as thumbnails.
+
 **Playlists** live in the sidebar: make one with **File ▸ New Playlist…**
 (or "Add to Playlist ▸ New Playlist…" on selected songs), then drag songs
 onto it. If a song is already in the playlist you're asked whether to add it
