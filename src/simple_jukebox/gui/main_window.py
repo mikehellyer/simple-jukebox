@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from simple_jukebox import __version__
 from simple_jukebox.core.artwork import find_art
+from simple_jukebox.core.diagnostics import note_current_track
 from simple_jukebox.core.library import Library, Track
 from simple_jukebox.core.play_queue import PlayQueue
 from simple_jukebox.core.self_update import (
@@ -788,6 +789,7 @@ class MainWindow(QMainWindow):
             return
         self._current = track
         self._play_recorded = False
+        note_current_track(track.path)
         self._player.setSource(QUrl.fromLocalFile(track.path))
         self._player.play()
         self._player_bar.set_active(True)
@@ -855,7 +857,12 @@ class MainWindow(QMainWindow):
 
     def _on_media_status_changed(self, status) -> None:
         if status == QMediaPlayer.EndOfMedia:
-            self._play_next()
+            # Don't swap the player's source from inside its own
+            # end-of-media signal — the backend is still finishing that
+            # track when this runs, and changing source re-entrantly can
+            # leave it replaying the old track or stuck. Advance once
+            # control is back in the event loop instead.
+            QTimer.singleShot(0, self._play_next)
 
     def _on_playback_state_changed(self, state) -> None:
         self._player_bar.set_playing(state == QMediaPlayer.PlayingState)
