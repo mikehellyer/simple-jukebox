@@ -427,9 +427,15 @@ def default_podcast_folder_for(music_folder: str) -> str:
     if not music_folder:
         return ""
     music = Path(music_folder)
-    for name in ("Podcasts", "PODCASTS", "podcasts"):
-        if (music.parent / name).is_dir():
-            return str(music.parent / name)
+    # Use an existing folder's real name, whatever its case — on
+    # case-insensitive filesystems (macOS, SD cards) "Podcasts" would
+    # also match "PODCASTS", but the name shown should be the real one.
+    try:
+        for entry in sorted(music.parent.iterdir()):
+            if entry.name.lower() == "podcasts" and entry.is_dir():
+                return str(entry)
+    except OSError:
+        pass
     return str(music.parent / "Podcasts")
 
 
