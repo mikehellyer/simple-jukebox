@@ -873,7 +873,6 @@ class MainWindow(QMainWindow):
         self._player_bar.set_art(find_art(Path(track.path)))
         self._model.set_playing(track.id)
         self._refresh_up_next()
-        self.setWindowTitle(f"{track.title} — {track.artist} · Simple-Jukebox")
 
     def _toggle_play_pause(self) -> None:
         if self._focus_is_text_entry():
@@ -913,7 +912,6 @@ class MainWindow(QMainWindow):
         self._player_bar.set_active(False)
         self._model.set_playing(None)
         self._refresh_up_next()
-        self.setWindowTitle(f"Simple-Jukebox v{__version__}")
 
     def _on_position_changed(self, position_ms: int) -> None:
         duration_ms = self._player.duration()
