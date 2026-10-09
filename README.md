@@ -23,7 +23,9 @@ Strawberry's album view. Click an album to list its songs below, double-click
 to play it, right-click to queue it or add it to a playlist, or drag it onto a
 playlist or the Up Next panel. The search box filters the grid. Covers come
 from the songs' embedded art or a `cover.jpg`/`folder.jpg` in the album
-folder, load in the background, and are cached as thumbnails.
+folder, load in the background, and are cached as thumbnails. Albums split
+across discs in their tags ("… [Disc 1]", "… (CD 2)", "… - Disc One") show as
+one album, playing in disc order.
 
 **Playlists** live in the sidebar: make one with **File ▸ New Playlist…**
 (or "Add to Playlist ▸ New Playlist…" on selected songs), then drag songs

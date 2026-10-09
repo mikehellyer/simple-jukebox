@@ -12,6 +12,7 @@ file, then refreshes its views from the main thread's instance.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -62,6 +63,42 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
 
 # Album order: by disc, then track number, then title for untagged files.
 TRACK_ORDER = "album_artist COLLATE NOCASE, year, album COLLATE NOCASE, disc_number, track_number, title COLLATE NOCASE"
+
+
+# "Live [Disc 1]", "Live (CD 2)", "Live - Disc One", "Live, Disk 2 of 2" …
+# — one album split across discs in its tags.
+_DISC_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+_DISC_SUFFIX = re.compile(
+    # \b: "CD" must be a word of its own — not the end of a catalogue
+    # number like "[MFSL UDCD-788]"; and real disc numbers are 1–2 digits.
+    r"\s*(?:[-–—,:]\s*)?[\[\(\{]?\s*\b(?:disc|disk|cd)\s*[-.#]?\s*"
+    r"(\d{1,2}|" + "|".join(_DISC_WORDS) + r")\b"
+    r"(?:\s*(?:of|/)\s*\d+)?\s*[\]\)\}]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def split_disc(album: str) -> tuple[str, Optional[int]]:
+    """("Live [Disc 2]") → ("Live", 2); albums without a disc marker are
+    returned unchanged, with None."""
+    match = _DISC_SUFFIX.search(album or "")
+    if not match:
+        return album, None
+    base = album[: match.start()].rstrip(" -–—,:")
+    if not base:
+        return album, None  # the whole name is "CD 1" — leave it alone
+    number = match.group(1).lower()
+    return base, _DISC_WORDS.get(number) or int(number)
+
+
+def album_base(album: str) -> str:
+    return split_disc(album)[0]
+
+
+def _album_order(track: "Track") -> tuple:
+    """Order within a (possibly multi-disc) album: disc, then track."""
+    disc = track.disc_number or split_disc(track.album)[1] or 0
+    return (disc, track.track_number or 0, track.title.lower())
 
 
 @dataclass
@@ -261,6 +298,18 @@ class Library:
         return [row[0] for row in rows]
 
     def albums(self, artist: Optional[str] = None) -> list[tuple[str, str, Optional[int]]]:
+        """(album_artist, album, year) for every album, optionally for one
+        artist. Discs of one album ("… [Disc 1]", "… [Disc 2]") count as one."""
+        merged: dict[tuple[str, str], Optional[int]] = {}
+        for album_artist, name, year in self._album_rows(artist):
+            key = (album_artist, album_base(name))
+            if key not in merged:
+                merged[key] = year
+            elif year and (merged[key] is None or year > merged[key]):
+                merged[key] = year  # latest year of any disc, like MAX(year)
+        return [(artist_name, name, year) for (artist_name, name), year in merged.items()]
+
+    def _album_rows(self, artist: Optional[str] = None) -> list[tuple[str, str, Optional[int]]]:
         """(album_artist, album, year) for every album, optionally for one artist."""
         sql = "SELECT album_artist, album, MAX(year) FROM tracks"
         params: list = []
@@ -285,8 +334,11 @@ class Library:
             clauses.append("album_artist = ?")
             params.append(artist)
         if album is not None:
-            clauses.append("album = ?")
-            params.append(album)
+            # Matches every disc of a multi-disc album ("Live" finds
+            # "Live [Disc 1]" and "Live [Disc 2]"); refined in Python below.
+            base = album_base(album)
+            clauses.append("(album = ? OR album LIKE ? ESCAPE '\\')")
+            params.extend([base, base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"])
         for word in search.split():
             like = f"%{word}%"
             clauses.append("(title LIKE ? OR artist LIKE ? OR album LIKE ? OR album_artist LIKE ? OR genre LIKE ?)")
@@ -295,19 +347,25 @@ class Library:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += f" ORDER BY {TRACK_ORDER}"
-        return [Track(**dict(row)) for row in self._conn.execute(sql, params)]
+        tracks = [Track(**dict(row)) for row in self._conn.execute(sql, params)]
+        if album is not None:
+            base = album_base(album)
+            tracks = [t for t in tracks if album_base(t.album) == base]
+            tracks.sort(key=lambda t: (t.album_artist.lower(), _album_order(t)))
+        return tracks
 
     def album_summaries(self, search: str = "") -> list[AlbumSummary]:
         """Every album (optionally only those with a song matching search),
         in artist, year, album order."""
         summaries: dict[tuple[str, str], AlbumSummary] = {}
         for track in self.tracks(search=search):
-            key = (track.album_artist, track.album)
+            base = album_base(track.album)
+            key = (track.album_artist, base)
             summary = summaries.get(key)
             if summary is None:
                 summaries[key] = AlbumSummary(
                     album_artist=track.album_artist,
-                    album=track.album,
+                    album=base,
                     year=track.year,
                     track_count=1,
                     cover_path=track.path,

@@ -173,3 +173,58 @@ def test_album_summaries_group_and_search(tmp_path):
     assert albums[0].cover_path.endswith("a2.mp3")  # Song A is track 1
     assert [a.album for a in library.album_summaries(search="encore")] == ["Live"]
     assert [t.title for t in library.album_tracks("Alpha", "Debut")] == ["Song A", "Song B"]
+
+
+def test_split_disc_recognises_common_disc_markers():
+    from simple_jukebox.core.library import split_disc
+
+    assert split_disc("At Budokan: The Complete Concert [Disc 1]") == ("At Budokan: The Complete Concert", 1)
+    assert split_disc("Live (CD 2)") == ("Live", 2)
+    assert split_disc("Live - Disc One") == ("Live", 1)
+    assert split_disc("Live, Disk 2 of 3") == ("Live", 2)
+    assert split_disc("The Wall CD2") == ("The Wall", 2)
+    assert split_disc("Live {disc 10}") == ("Live", 10)
+    # Not disc markers:
+    assert split_disc("Discovery") == ("Discovery", None)
+    assert split_disc("1984") == ("1984", None)
+    assert split_disc("CD 1") == ("CD 1", None)
+    assert split_disc("Abracadabra") == ("Abracadabra", None)
+    assert split_disc("Shake It Up [MFSL UDCD-788]") == ("Shake It Up [MFSL UDCD-788]", None)
+    assert split_disc("Greatest Hits CD 788") == ("Greatest Hits CD 788", None)
+
+
+def test_multi_disc_albums_are_merged_and_play_in_disc_order(tmp_path):
+    music = tmp_path / "music"
+    tags = {
+        "d2t1.flac": ("Cheap Trick", "At Budokan [Disc 2]", "Ain't That a Shame", 1),
+        "d1t2.flac": ("Cheap Trick", "At Budokan [Disc 1]", "Hello There", 2),
+        "d1t1.flac": ("Cheap Trick", "At Budokan [Disc 1]", "Elo Kiddies", 1),
+        "other.flac": ("Cheap Trick", "Dream Police", "Voices", 5),
+    }
+    for name in tags:
+        _touch(music, name)
+    library = Library(tmp_path / "lib.sqlite3")
+    library.scan([str(music)], read=_fake_reader(tags))
+
+    assert [a.album for a in library.album_summaries()] == ["At Budokan", "Dream Police"]
+    budokan = library.album_summaries()[0]
+    assert budokan.track_count == 3
+    assert [name for _, name, _ in library.albums("Cheap Trick")] == ["At Budokan", "Dream Police"]
+    assert [t.title for t in library.album_tracks("Cheap Trick", "At Budokan")] == [
+        "Elo Kiddies", "Hello There", "Ain't That a Shame",
+    ]
+    # Asking for one disc by its full name still finds the whole album.
+    assert len(library.tracks(album="At Budokan [Disc 2]")) == 3
+
+
+def test_album_filter_treats_like_wildcards_literally(tmp_path):
+    music = tmp_path / "music"
+    tags = {
+        "a.flac": ("X", "100% Hits", "One", 1),
+        "b.flac": ("X", "100 Hits", "Two", 1),
+    }
+    for name in tags:
+        _touch(music, name)
+    library = Library(tmp_path / "lib.sqlite3")
+    library.scan([str(music)], read=_fake_reader(tags))
+    assert [t.title for t in library.tracks(album="100% Hits")] == ["One"]
