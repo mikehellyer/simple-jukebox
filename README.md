@@ -20,7 +20,9 @@ quick.
 
 **Playlists** live in the sidebar: make one with **File ▸ New Playlist…**
 (or "Add to Playlist ▸ New Playlist…" on selected songs), then drag songs
-onto it. Inside a playlist, drag rows to reorder them and press Delete to
+onto it. If a song is already in the playlist you're asked whether to add it
+again or skip it (adding several at once, you can apply that answer to the
+rest). Inside a playlist, drag rows to reorder them and press Delete to
 remove them. Right-click a playlist to play, rename, or delete it.
 
 **Up Next** (the panel on the right, **View ▸ Show Up Next** / Ctrl+U)

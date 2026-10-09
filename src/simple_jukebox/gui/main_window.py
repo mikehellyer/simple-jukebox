@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QShort
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
@@ -33,7 +34,7 @@ from PySide6.QtWidgets import (
 from simple_jukebox import __version__
 from simple_jukebox.core.artwork import find_art
 from simple_jukebox.core.diagnostics import note_current_track
-from simple_jukebox.core.library import Library, Track
+from simple_jukebox.core.library import Library, Track, already_in_playlist
 from simple_jukebox.core.play_queue import PlayQueue
 from simple_jukebox.core.self_update import (
     download_asset,
@@ -648,13 +649,74 @@ class MainWindow(QMainWindow):
             self._sources.select_source(KIND_PLAYLIST, playlist_id)
 
     def _add_to_playlist(self, playlist_id: int, track_ids: list[int]) -> None:
+        name = next((p.name for p in self._library.playlists() if p.id == playlist_id), "playlist")
+        duplicates = already_in_playlist(self._library.playlist_track_ids(playlist_id), track_ids)
+        skipped = 0
+        if duplicates:
+            kept = self._ask_about_playlist_duplicates(name, track_ids, duplicates)
+            if kept is None:
+                self._status.showMessage(f"Nothing added to {name}", 4000)
+                return
+            skipped = len(track_ids) - len(kept)
+            track_ids = kept
+
+        def songs(count: int) -> str:
+            return f"{count} song{'s' if count != 1 else ''}"
+
+        if not track_ids:
+            self._status.showMessage(f"Nothing added — already in {name}", 4000)
+            return
         self._library.add_to_playlist(playlist_id, track_ids)
         self._refresh_playlists()
-        name = next((p.name for p in self._library.playlists() if p.id == playlist_id), "playlist")
-        count = len(track_ids)
-        self._status.showMessage(f"Added {count} song{'s' if count != 1 else ''} to {name}", 4000)
+        message = f"Added {songs(len(track_ids))} to {name}"
+        if skipped:
+            message += f" (skipped {songs(skipped)} already in it)"
+        self._status.showMessage(message, 5000)
         if self._playlist_id() == playlist_id:
             self._refresh_tracks()
+
+    def _ask_about_playlist_duplicates(
+        self, playlist_name: str, track_ids: list[int], duplicates: list[int]
+    ) -> Optional[list[int]]:
+        """Ask, song by song, whether to add songs already in the playlist
+        again — with an "apply to the rest" option when there are several.
+        Returns the ids to add, or None if the user cancelled the whole add."""
+        tracks = self._library.tracks_by_ids(track_ids)
+        skip: set[int] = set()  # indexes into track_ids
+        decision_for_rest: Optional[bool] = None  # True = add again, False = skip
+        for position, index in enumerate(duplicates):
+            if decision_for_rest is None:
+                track = tracks.get(track_ids[index])
+                song = f"“{track.title}” by {track.artist}" if track else "This song"
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Already in Playlist")
+                box.setText(f"{song} is already in “{playlist_name}”.")
+                box.setInformativeText("Add it again?")
+                add_button = box.addButton("Add Again", QMessageBox.YesRole)
+                skip_button = box.addButton("Skip", QMessageBox.NoRole)
+                box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(skip_button)
+                remaining = len(duplicates) - position - 1
+                apply_to_rest = None
+                if remaining:
+                    apply_to_rest = QCheckBox(
+                        f"Do the same for the other {remaining} song{'s' if remaining != 1 else ''} "
+                        "already in this playlist"
+                    )
+                    box.setCheckBox(apply_to_rest)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked not in (add_button, skip_button):
+                    return None  # Cancel, Escape or the window's close button
+                add_again = clicked is add_button
+                if apply_to_rest is not None and apply_to_rest.isChecked():
+                    decision_for_rest = add_again
+            else:
+                add_again = decision_for_rest
+            if not add_again:
+                skip.add(index)
+        return [track_id for index, track_id in enumerate(track_ids) if index not in skip]
 
     def _remove_selected_from_playlist(self) -> None:
         playlist_id = self._playlist_id()

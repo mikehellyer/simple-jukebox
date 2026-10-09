@@ -104,6 +104,18 @@ _TRACK_COLUMNS = (
 )
 
 
+def already_in_playlist(existing_ids: Iterable[int], new_ids: list[int]) -> list[int]:
+    """Indexes into new_ids of songs that would end up in the playlist
+    twice — already in it, or repeated earlier in new_ids itself."""
+    present = set(existing_ids)
+    duplicates = []
+    for index, track_id in enumerate(new_ids):
+        if track_id in present:
+            duplicates.append(index)
+        present.add(track_id)
+    return duplicates
+
+
 def default_db_path() -> Path:
     return Path(user_data_dir("Simple-Jukebox")) / "library.sqlite3"
 
@@ -351,7 +363,8 @@ class Library:
         )
         return [Track(**dict(row)) for row in rows]
 
-    def _playlist_track_ids(self, playlist_id: int) -> list[int]:
+    def playlist_track_ids(self, playlist_id: int) -> list[int]:
+        """Track ids in playlist order (repeats included)."""
         rows = self._conn.execute(
             "SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position", (playlist_id,)
         )
@@ -367,19 +380,19 @@ class Library:
         self._conn.commit()
 
     def add_to_playlist(self, playlist_id: int, track_ids: list[int]) -> None:
-        self.set_playlist_tracks(playlist_id, self._playlist_track_ids(playlist_id) + list(track_ids))
+        self.set_playlist_tracks(playlist_id, self.playlist_track_ids(playlist_id) + list(track_ids))
 
     def remove_from_playlist(self, playlist_id: int, positions: Iterable[int]) -> None:
         """Remove entries by their position in the playlist (0-based)."""
         drop = set(positions)
-        kept = [tid for pos, tid in enumerate(self._playlist_track_ids(playlist_id)) if pos not in drop]
+        kept = [tid for pos, tid in enumerate(self.playlist_track_ids(playlist_id)) if pos not in drop]
         self.set_playlist_tracks(playlist_id, kept)
 
     def move_in_playlist(self, playlist_id: int, positions: list[int], to_position: int) -> None:
         """Move the entries at positions (kept in their relative order) so
         the first lands at to_position — counted in the playlist as it was
         before the move, like a drag-and-drop insertion point."""
-        track_ids = self._playlist_track_ids(playlist_id)
+        track_ids = self.playlist_track_ids(playlist_id)
         moving_positions = sorted(p for p in set(positions) if 0 <= p < len(track_ids))
         moving = [track_ids[p] for p in moving_positions]
         insert_at = to_position - sum(1 for p in moving_positions if p < to_position)

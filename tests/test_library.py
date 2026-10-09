@@ -154,3 +154,10 @@ def test_tracks_by_ids_skips_unknown_ids(tmp_path):
     ids = [t.id for t in library.tracks()]
     found = library.tracks_by_ids(ids + [9999])
     assert sorted(found) == sorted(ids)
+
+
+def test_already_in_playlist_finds_existing_and_repeated_songs():
+    from simple_jukebox.core.library import already_in_playlist
+
+    assert already_in_playlist([1, 2], [3, 2, 4, 3, 1]) == [1, 3, 4]
+    assert already_in_playlist([], [5, 6]) == []
