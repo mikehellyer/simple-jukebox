@@ -2,12 +2,13 @@
 playing, previous/play/next, a seek bar, shuffle/repeat and volume."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -18,6 +19,30 @@ from simple_jukebox.core.text import format_duration
 ART_SIZE = 72
 REPEAT_LABELS = {"off": "🔁 Off", "all": "🔁 All", "one": "🔂 One"}
 NEXT_REPEAT = {"off": "all", "all": "one", "one": "off"}
+
+
+class _ElidedLabel(QLabel):
+    """A label that shortens long text with "…" to fit, instead of
+    demanding enough width for all of it (which would stretch the whole
+    window for a long song title). The full text is in the tooltip."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self.setToolTip(text)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        elided = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.contentsRect().width())
+        painter.drawText(self.contentsRect(), int(self.alignment()), elided)
 
 
 class PlayerBar(QWidget):
@@ -53,10 +78,10 @@ class PlayerBar(QWidget):
         outer.addLayout(transport)
 
         middle = QVBoxLayout()
-        self._title = QLabel("Not playing")
+        self._title = _ElidedLabel("Not playing")
         self._title.setAlignment(Qt.AlignCenter)
         self._title.setStyleSheet("font-weight: 600; font-size: 14px;")
-        self._subtitle = QLabel("")
+        self._subtitle = _ElidedLabel("")
         self._subtitle.setAlignment(Qt.AlignCenter)
         self._subtitle.setStyleSheet("color: gray;")
         middle.addWidget(self._title)
@@ -72,21 +97,27 @@ class PlayerBar(QWidget):
         self._seek_slider.setRange(0, 0)
         self._seek_slider.sliderPressed.connect(self._on_slider_pressed)
         self._seek_slider.sliderReleased.connect(self._on_slider_released)
+        # Shuffle/repeat share this row, so keep the bar usefully long.
+        self._seek_slider.setMinimumWidth(200)
         seek_row.addWidget(self._elapsed)
         seek_row.addWidget(self._seek_slider, stretch=1)
         seek_row.addWidget(self._remaining)
-        middle.addLayout(seek_row)
-        outer.addLayout(middle, stretch=1)
 
+        # Shuffle/repeat sit beside the progress bar rather than up with
+        # the title, so they're nearer the track list and long song
+        # names get the whole width of the title line.
+        seek_row.addSpacing(8)
         self._shuffle_button = QPushButton("🔀 Shuffle")
         self._shuffle_button.setCheckable(True)
         self._shuffle_button.toggled.connect(self.shuffle_toggled)
-        outer.addWidget(self._shuffle_button)
+        seek_row.addWidget(self._shuffle_button)
 
         self._repeat = "off"
         self._repeat_button = QPushButton(REPEAT_LABELS["off"])
         self._repeat_button.clicked.connect(self._cycle_repeat)
-        outer.addWidget(self._repeat_button)
+        seek_row.addWidget(self._repeat_button)
+        middle.addLayout(seek_row)
+        outer.addLayout(middle, stretch=1)
 
         outer.addWidget(QLabel("🔈"))
         self._volume = QSlider(Qt.Horizontal)

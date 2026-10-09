@@ -29,6 +29,17 @@ Next** or **Add to Up Next**, or drag them into the panel. Within the
 panel, drag to reorder, double-click to jump ahead, and press Delete to
 remove a song.
 
+**Sync to Device** (**File ▸ Sync to Device…**, Ctrl+Shift+S) copies music
+onto a portable player — a Sony Walkman, a phone, or any SD card or USB
+stick. Give the device a name and pick its Music folder (on Linux a player
+plugged in by USB shows up under **Detected** once it's unlocked and opened in
+the file manager; on any OS you can use its microSD card in a card reader).
+Choose the entire library or particular playlists and artists; songs go into
+`Artist/Album` folders and playlists become `.m3u` files the player can read.
+Syncs are incremental, and "remove songs no longer selected" only ever deletes
+files Simple-Jukebox itself copied — it keeps a list of those on the device.
+Each device's choices are remembered for next time.
+
 ## Development setup
 
 ```bash

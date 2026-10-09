@@ -15,12 +15,40 @@ REPEAT_MODES = ("off", "all", "one")
 
 
 @dataclass
+class DeviceProfile:
+    """A player to sync to: where it mounts and what goes on it."""
+
+    name: str
+    path: str
+    whole_library: bool = False
+    playlist_ids: list[int] = field(default_factory=list)
+    artists: list[str] = field(default_factory=list)
+    copy_playlists: bool = True
+    remove_unselected: bool = True
+
+    @classmethod
+    def from_dict(cls, data) -> Optional["DeviceProfile"]:
+        if not isinstance(data, dict) or not isinstance(data.get("name"), str) or not isinstance(data.get("path"), str):
+            return None
+        return cls(
+            name=data["name"],
+            path=data["path"],
+            whole_library=bool(data.get("whole_library", False)),
+            playlist_ids=[i for i in data.get("playlist_ids", []) if isinstance(i, int)],
+            artists=[a for a in data.get("artists", []) if isinstance(a, str)],
+            copy_playlists=bool(data.get("copy_playlists", True)),
+            remove_unselected=bool(data.get("remove_unselected", True)),
+        )
+
+
+@dataclass
 class Settings:
     music_folders: list[str] = field(default_factory=list)
     volume: int = 80
     shuffle: bool = False
     repeat: str = "off"
     show_up_next: bool = True
+    devices: list[DeviceProfile] = field(default_factory=list)
 
 
 class SettingsStore:
@@ -85,6 +113,22 @@ class SettingsStore:
         self._settings.show_up_next = show
         self.save()
 
+    @property
+    def devices(self) -> list[DeviceProfile]:
+        return list(self._settings.devices)
+
+    def save_device(self, profile: DeviceProfile, old_name: Optional[str] = None) -> None:
+        """Add a device, or replace the one called old_name (or profile.name)."""
+        key = old_name if old_name is not None else profile.name
+        devices = [d for d in self._settings.devices if d.name != key and d.name != profile.name]
+        devices.append(profile)
+        self._settings.devices = sorted(devices, key=lambda d: d.name.lower())
+        self.save()
+
+    def remove_device(self, name: str) -> None:
+        self._settings.devices = [d for d in self._settings.devices if d.name != name]
+        self.save()
+
     def load(self) -> None:
         if not self._config_path.exists():
             return
@@ -103,6 +147,10 @@ class SettingsStore:
             self._settings.shuffle = data["shuffle"]
         if isinstance(data.get("show_up_next"), bool):
             self._settings.show_up_next = data["show_up_next"]
+        if isinstance(data.get("devices"), list):
+            self._settings.devices = [
+                profile for profile in map(DeviceProfile.from_dict, data["devices"]) if profile is not None
+            ]
         if data.get("repeat") in REPEAT_MODES:
             self._settings.repeat = data["repeat"]
 

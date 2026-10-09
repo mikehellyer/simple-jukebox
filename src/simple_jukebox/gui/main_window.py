@@ -43,6 +43,7 @@ from simple_jukebox.core.self_update import (
 from simple_jukebox.core.settings import SettingsStore
 from simple_jukebox.core.updater import API_TIMEOUT_SECONDS, check_for_update
 from simple_jukebox.gui.player_bar import PlayerBar
+from simple_jukebox.gui.sync_dialog import SyncDialog
 from simple_jukebox.gui.source_list import KIND_LIBRARY, KIND_PLAYLIST, SourceList
 from simple_jukebox.gui.track_model import COLUMNS, RATING_COLUMN, TrackTableModel
 from simple_jukebox.gui.up_next_panel import UpNextPanel
@@ -173,7 +174,8 @@ class MainWindow(QMainWindow):
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search library…")
         self._search.setClearButtonEnabled(True)
-        self._search.setFixedWidth(240)
+        self._search.setMinimumWidth(120)
+        self._search.setMaximumWidth(240)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
@@ -337,6 +339,12 @@ class MainWindow(QMainWindow):
         rescan_action.setShortcut(QKeySequence("F5"))
         rescan_action.triggered.connect(self._start_scan)
         file_menu.addAction(rescan_action)
+
+        file_menu.addSeparator()
+        sync_action = QAction("Sync to &Device…", self)
+        sync_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        sync_action.triggered.connect(self._open_sync_dialog)
+        file_menu.addAction(sync_action)
 
         file_menu.addSeparator()
         quit_action = QAction("&Quit", self)
@@ -614,6 +622,11 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(first.path).parent))),
         )
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    # --- devices --------------------------------------------------------
+
+    def _open_sync_dialog(self) -> None:
+        SyncDialog(self._library, self._settings, self._run_in_background, self).exec()
 
     # --- playlists ------------------------------------------------------
 
