@@ -40,6 +40,19 @@ Next** or **Add to Up Next**, or drag them into the panel. Within the
 panel, drag to reorder, double-click to jump ahead, and press Delete to
 remove a song.
 
+**Podcasts** (in the sidebar) is for subscribing to and managing shows. Click
+**＋ Subscribe…** (or **File ▸ Subscribe to Podcast…**) to search the Apple
+Podcasts directory or paste a feed address. Feeds are checked at startup, every
+two hours, and with **Refresh**. Per show you can download new episodes
+automatically and keep only the newest few downloads. Right-click episodes to
+download, delete downloads, or mark them played/unplayed; double-click to play
+— episodes resume where you left off, ⏮/⏭ skip back 15s / forward 30s, and a
+finished episode is marked played. Downloads go into a Podcasts folder beside
+your Music folder (never into the music library), as `Show/YYYY-MM-DD
+Episode.mp3`, tagged as podcasts: genre "Podcast", the show as album, and the
+podcast markers players look for (ID3's podcast flag and feed/episode ids for
+MP3; iTunes' podcast flag and media kind for M4A).
+
 **Sync to Device** (**File ▸ Sync to Device…**, Ctrl+Shift+S) copies music
 onto a portable player — a Sony Walkman, a phone, or any SD card or USB
 stick. Give the device a name and pick its Music folder (on Linux a player
@@ -54,6 +67,12 @@ another app) are recognised by folder and file name, or failing that by their
 tags, and aren't copied again; playlists point at the copy that's there, and
 any duplicate an earlier sync made is removed (your copy is kept).
 Each device's choices are remembered for next time.
+
+The **Podcasts** tab syncs downloaded episodes (all shows or chosen ones,
+optionally only unplayed) into the device's **Podcasts** folder — by default the
+one beside its Music folder. On an Android player such as a Sony Walkman,
+anything in that folder is listed under Podcasts rather than Music. Episodes
+copied earlier are removed from the device once they're played or deleted here.
 
 ## Development setup
 
@@ -79,7 +98,7 @@ pytest
 ## Project layout
 
 - `src/simple_jukebox/core/` — tag reading, the SQLite library (tracks
-  and playlists), the Up Next play queue, settings, and the update checker; plain Python, no Qt dependency,
+  and playlists), podcast feeds/subscriptions/downloads, the Up Next play queue, settings, and the update checker; plain Python, no Qt dependency,
   covered by `tests/`.
 - `src/simple_jukebox/gui/` — the PySide6 window and widgets.
 - `src/simple_jukebox/app.py` — entry point.

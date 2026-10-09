@@ -265,3 +265,40 @@ def test_tag_cache_avoids_rereading_on_the_next_sync(tmp_path):
     users.write_bytes(b"changed size")  # a changed file is read again
     plan_sync(dest, [track], tag_reader=tags, tag_cache_path=cache)
     assert len(read) == 2
+
+
+def test_podcast_file_sync_and_removal(tmp_path):
+    from simple_jukebox.core.device_sync import plan_file_sync
+
+    dest = tmp_path / "Podcasts"
+    dest.mkdir()
+    a = tmp_path / "a.mp3"
+    a.write_bytes(b"aa")
+    b = tmp_path / "b.mp3"
+    b.write_bytes(b"bbb")
+    users = dest / "Other Show" / "theirs.mp3"
+    users.parent.mkdir()
+    users.write_bytes(b"x")
+
+    plan = plan_file_sync(dest, [(str(a), "Show/2026-10-01 A.mp3"), (str(b), "Show/2026-10-08 B.mp3")])
+    assert plan.bytes_to_copy == 5
+    run_sync(plan)
+    assert (dest / "Show/2026-10-08 B.mp3").read_bytes() == b"bbb"
+
+    # A is played now, so it's no longer selected: removed. The user's file stays.
+    plan = plan_file_sync(dest, [(str(b), "Show/2026-10-08 B.mp3")])
+    assert plan.deletes == ["Show/2026-10-01 A.mp3"] and plan.unchanged == 1
+    run_sync(plan)
+    assert not (dest / "Show/2026-10-01 A.mp3").exists()
+    assert users.exists()
+
+
+def test_default_podcast_folder_sits_beside_music(tmp_path):
+    from simple_jukebox.core.device_sync import default_podcast_folder_for
+
+    music = tmp_path / "Internal shared storage" / "Music"
+    music.mkdir(parents=True)
+    assert default_podcast_folder_for(str(music)) == str(music.parent / "Podcasts")
+    (music.parent / "PODCASTS").mkdir()
+    assert default_podcast_folder_for(str(music)) == str(music.parent / "PODCASTS")
+    assert default_podcast_folder_for("") == ""

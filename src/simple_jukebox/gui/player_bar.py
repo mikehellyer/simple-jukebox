@@ -169,6 +169,20 @@ class PlayerBar(QWidget):
             self._elapsed.setText("")
             self._remaining.setText("")
 
+    def set_podcast_mode(self, podcast: bool) -> None:
+        """While an episode plays, ⏮/⏭ skip back 15s / forward 30s — the
+        usual podcast controls — instead of changing track."""
+        if podcast:
+            self._previous_button.setText("−15")
+            self._previous_button.setToolTip("Back 15 seconds")
+            self._next_button.setText("+30")
+            self._next_button.setToolTip("Forward 30 seconds")
+        else:
+            self._previous_button.setText("⏮")
+            self._previous_button.setToolTip("Previous track")
+            self._next_button.setText("⏭")
+            self._next_button.setToolTip("Next track")
+
     def set_volume(self, volume: int) -> None:
         self._volume.setValue(volume)
 

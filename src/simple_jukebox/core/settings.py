@@ -21,11 +21,17 @@ class DeviceProfile:
     name: str
     path: str
     whole_library: bool = False
+    sync_music: bool = True
     playlist_ids: list[int] = field(default_factory=list)
     artists: list[str] = field(default_factory=list)
     copy_playlists: bool = True
     remove_unselected: bool = True
     find_existing: bool = True  # skip songs already on the device under another name
+    sync_podcasts: bool = False
+    podcast_path: str = ""  # the device's Podcasts folder
+    all_podcasts: bool = True
+    podcast_ids: list[int] = field(default_factory=list)
+    podcast_unplayed_only: bool = True
 
     @classmethod
     def from_dict(cls, data) -> Optional["DeviceProfile"]:
@@ -35,11 +41,17 @@ class DeviceProfile:
             name=data["name"],
             path=data["path"],
             whole_library=bool(data.get("whole_library", False)),
+            sync_music=bool(data.get("sync_music", True)),
             playlist_ids=[i for i in data.get("playlist_ids", []) if isinstance(i, int)],
             artists=[a for a in data.get("artists", []) if isinstance(a, str)],
             copy_playlists=bool(data.get("copy_playlists", True)),
             remove_unselected=bool(data.get("remove_unselected", True)),
             find_existing=bool(data.get("find_existing", True)),
+            sync_podcasts=bool(data.get("sync_podcasts", False)),
+            podcast_path=data["podcast_path"] if isinstance(data.get("podcast_path"), str) else "",
+            all_podcasts=bool(data.get("all_podcasts", True)),
+            podcast_ids=[i for i in data.get("podcast_ids", []) if isinstance(i, int)],
+            podcast_unplayed_only=bool(data.get("podcast_unplayed_only", True)),
         )
 
 
@@ -51,6 +63,7 @@ class Settings:
     repeat: str = "off"
     show_up_next: bool = True
     devices: list[DeviceProfile] = field(default_factory=list)
+    podcasts_folder: str = ""  # "" = the default, beside the Music folder
 
 
 class SettingsStore:
@@ -116,6 +129,14 @@ class SettingsStore:
         self.save()
 
     @property
+    def podcasts_folder(self) -> str:
+        return self._settings.podcasts_folder
+
+    def set_podcasts_folder(self, folder: str) -> None:
+        self._settings.podcasts_folder = folder
+        self.save()
+
+    @property
     def devices(self) -> list[DeviceProfile]:
         return list(self._settings.devices)
 
@@ -149,6 +170,8 @@ class SettingsStore:
             self._settings.shuffle = data["shuffle"]
         if isinstance(data.get("show_up_next"), bool):
             self._settings.show_up_next = data["show_up_next"]
+        if isinstance(data.get("podcasts_folder"), str):
+            self._settings.podcasts_folder = data["podcasts_folder"]
         if isinstance(data.get("devices"), list):
             self._settings.devices = [
                 profile for profile in map(DeviceProfile.from_dict, data["devices"]) if profile is not None

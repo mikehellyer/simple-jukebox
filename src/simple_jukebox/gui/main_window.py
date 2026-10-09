@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from PySide6.QtCore import QItemSelectionModel, QObject, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal
@@ -45,6 +46,9 @@ from simple_jukebox.core.settings import SettingsStore
 from simple_jukebox.core.updater import API_TIMEOUT_SECONDS, check_for_update
 from simple_jukebox.gui.album_grid import AlbumGridModel, AlbumGridView
 from simple_jukebox.gui.player_bar import PlayerBar
+from simple_jukebox.gui.podcast_manager import PodcastManager
+from simple_jukebox.gui.podcasts_page import PodcastsPage
+from simple_jukebox.gui.subscribe_dialog import SubscribeDialog
 from simple_jukebox.gui.sync_dialog import SyncDialog
 from simple_jukebox.gui.source_list import KIND_LIBRARY, KIND_PLAYLIST, SourceList
 from simple_jukebox.gui.track_model import COLUMNS, RATING_COLUMN, TrackTableModel
@@ -60,6 +64,11 @@ SOURCE_ALL = "All Music"
 SOURCE_ALBUMS = "Albums"
 SOURCE_RECENT = "Recently Added"
 SOURCE_MOST_PLAYED = "Most Played"
+SOURCE_PODCASTS = "Podcasts"
+
+PODCAST_SKIP_BACK_MS = 15_000
+PODCAST_SKIP_FORWARD_MS = 30_000
+PODCAST_POSITION_SAVE_MS = 5_000
 ALL_ARTISTS = "All Artists"
 ALL_ALBUMS = "All Albums"
 
@@ -121,6 +130,10 @@ class MainWindow(QMainWindow):
         self._queue.shuffle = self._settings.shuffle
         self._queue.repeat = self._settings.repeat
         self._current: Optional[Track] = None
+        self._current_episode = None  # a podcast Episode, when one is playing
+        self._pending_seek_ms = 0  # where to resume an episode once it has loaded
+        self._last_position_save_ms = 0
+        self._podcasts = PodcastManager(self._settings, parent=self)
         self._play_recorded = False
         self._scanning = False
         self._background_threads: list[QThread] = []
@@ -149,6 +162,8 @@ class MainWindow(QMainWindow):
         if self._settings.music_folders:
             self._start_scan()
         self._check_for_updates()
+        # Look for new episodes shortly after startup, once the window is up.
+        QTimer.singleShot(3000, self._podcasts.refresh_all)
 
     # --- layout ---------------------------------------------------------
 
@@ -164,8 +179,8 @@ class MainWindow(QMainWindow):
 
         self._player_bar = PlayerBar()
         self._player_bar.play_pause_requested.connect(self._toggle_play_pause)
-        self._player_bar.previous_requested.connect(self._play_previous)
-        self._player_bar.next_requested.connect(lambda: self._play_next(user_requested=True))
+        self._player_bar.previous_requested.connect(self._on_previous_clicked)
+        self._player_bar.next_requested.connect(self._on_next_clicked)
         self._player_bar.seek_requested.connect(self._player.setPosition)
         self._player_bar.volume_changed.connect(self._on_volume_changed)
         self._player_bar.shuffle_toggled.connect(self._on_shuffle_toggled)
@@ -192,7 +207,7 @@ class MainWindow(QMainWindow):
 
         # Left: library sources. Right: artist/album column browser above
         # the track list, iTunes-style.
-        self._sources = SourceList([SOURCE_ALL, SOURCE_ALBUMS, SOURCE_RECENT, SOURCE_MOST_PLAYED])
+        self._sources = SourceList([SOURCE_ALL, SOURCE_ALBUMS, SOURCE_RECENT, SOURCE_MOST_PLAYED, SOURCE_PODCASTS])
         self._sources.currentRowChanged.connect(self._on_source_changed)
         self._sources.tracks_dropped_on_playlist.connect(self._add_to_playlist)
         self._sources.itemDoubleClicked.connect(lambda _item: self._play_source())
@@ -275,9 +290,18 @@ class MainWindow(QMainWindow):
         right.setSizes([200, 0, 520])
         self._right_split = right
 
+        # Podcasts get a page of their own in place of the music views.
+        self._podcasts_page = PodcastsPage(self._podcasts)
+        self._podcasts_page.play_requested.connect(self._play_episode)
+        self._podcasts_page.subscribe_requested.connect(self._subscribe_to_podcast)
+        self._podcasts.status.connect(lambda text: self._status.showMessage(text, 6000))
+        self._right_stack = QStackedWidget()
+        self._right_stack.addWidget(right)
+        self._right_stack.addWidget(self._podcasts_page)
+
         main_split = QSplitter(Qt.Horizontal)
         main_split.addWidget(sidebar)
-        main_split.addWidget(right)
+        main_split.addWidget(self._right_stack)
         main_split.setSizes([180, 1100])
         layout.addWidget(main_split, stretch=1)
 
@@ -356,6 +380,15 @@ class MainWindow(QMainWindow):
         file_menu.addAction(rescan_action)
 
         file_menu.addSeparator()
+        subscribe_action = QAction("Subscribe to &Podcast…", self)
+        subscribe_action.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        subscribe_action.triggered.connect(self._subscribe_to_podcast)
+        file_menu.addAction(subscribe_action)
+        refresh_podcasts_action = QAction("Refresh Podcasts", self)
+        refresh_podcasts_action.triggered.connect(self._podcasts.refresh_all)
+        file_menu.addAction(refresh_podcasts_action)
+        file_menu.addSeparator()
+
         sync_action = QAction("Sync to &Device…", self)
         sync_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         sync_action.triggered.connect(self._open_sync_dialog)
@@ -379,8 +412,8 @@ class MainWindow(QMainWindow):
         controls = self.menuBar().addMenu("&Controls")
         for text, shortcut, slot in (
             ("Play / Pause", "Space", self._toggle_play_pause),
-            ("Next Track", "Ctrl+Right", lambda: self._play_next(user_requested=True)),
-            ("Previous Track", "Ctrl+Left", self._play_previous),
+            ("Next Track", "Ctrl+Right", self._on_next_clicked),
+            ("Previous Track", "Ctrl+Left", self._on_previous_clicked),
             ("Find", "Ctrl+F", self._search.setFocus),
         ):
             action = QAction(text, self)
@@ -539,6 +572,12 @@ class MainWindow(QMainWindow):
         self._refresh_tracks()
 
     def _on_source_changed(self, _row: int) -> None:
+        podcasts = self._source() == (KIND_LIBRARY, SOURCE_PODCASTS)
+        self._right_stack.setCurrentWidget(self._podcasts_page if podcasts else self._right_split)
+        if podcasts:
+            self._podcasts_page.set_filter(self._search.text())
+            self._count_label.setText("")
+            return
         self._browser.setVisible(self._source() == (KIND_LIBRARY, SOURCE_ALL))
         albums = self._source() == (KIND_LIBRARY, SOURCE_ALBUMS)
         was_showing_albums = self._album_grid.isVisible()
@@ -555,9 +594,82 @@ class MainWindow(QMainWindow):
         self._refresh_tracks()
 
     def _on_search_changed(self) -> None:
+        if self._right_stack.currentWidget() is self._podcasts_page:
+            self._podcasts_page.set_filter(self._search.text())
+            return
         if self._album_grid.isVisible():
             self._refresh_album_grid()
         self._refresh_tracks()
+
+    # --- podcasts -------------------------------------------------------
+
+    def _subscribe_to_podcast(self) -> None:
+        dialog = SubscribeDialog(self._run_in_background, self)
+        if dialog.exec() and dialog.feed_url:
+            self._sources.select_source(KIND_LIBRARY, SOURCE_PODCASTS)
+            self._podcasts.subscribe(dialog.feed_url)
+
+    def _play_episode(self, episode_id: int) -> None:
+        episode = self._podcasts.episode(episode_id)
+        if episode is None:
+            return
+        self._save_episode_position()
+        self._current = None
+        self._model.set_playing(None)
+        self._current_episode = episode
+        self._pending_seek_ms = 0 if episode.played else episode.position_ms
+        self._last_position_save_ms = self._pending_seek_ms
+        if episode.downloaded:
+            source = QUrl.fromLocalFile(episode.local_path)
+            art = find_art(Path(episode.local_path)) or self._podcasts.artwork_bytes(episode.podcast_id)
+        else:
+            source = QUrl(episode.audio_url)
+            art = self._podcasts.artwork_bytes(episode.podcast_id)
+            self._status.showMessage("Streaming — download the episode to listen offline", 5000)
+        note_current_track(episode.local_path or episode.audio_url)
+        self._player.setSource(source)
+        self._player.play()
+        self._player_bar.set_active(True)
+        self._player_bar.set_podcast_mode(True)
+        self._player_bar.set_now_playing(episode.title, episode.podcast_title)
+        self._player_bar.set_art(art)
+        self._refresh_up_next()
+
+    def _save_episode_position(self) -> None:
+        if self._current_episode is not None:
+            position = self._player.position()
+            if position > 0:
+                self._podcasts.save_position(self._current_episode.id, position)
+
+    def _leave_episode(self) -> None:
+        """Before playing something else: remember where the episode got to."""
+        if self._current_episode is not None:
+            self._save_episode_position()
+            self._current_episode = None
+            self._pending_seek_ms = 0
+            self._player_bar.set_podcast_mode(False)
+            self._podcasts.changed.emit()
+
+    def _after_episode(self) -> None:
+        # An episode that finishes continues into Up Next, if anything's queued.
+        if self._queue.upcoming():
+            self._play_next(user_requested=True)
+        else:
+            self._stop()
+
+    def _on_previous_clicked(self) -> None:
+        if self._current_episode is not None:
+            self._player.setPosition(max(0, self._player.position() - PODCAST_SKIP_BACK_MS))
+        else:
+            self._play_previous()
+
+    def _on_next_clicked(self) -> None:
+        if self._current_episode is not None:
+            duration = self._player.duration()
+            target = self._player.position() + PODCAST_SKIP_FORWARD_MS
+            self._player.setPosition(min(target, duration - 1000) if duration > 0 else target)
+        else:
+            self._play_next(user_requested=True)
 
     # --- album grid -----------------------------------------------------
 
@@ -635,6 +747,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_tracks(self) -> None:
         kind, source = self._source()
+        if (kind, source) == (KIND_LIBRARY, SOURCE_PODCASTS):
+            return  # the podcasts page keeps itself up to date
         if kind == KIND_PLAYLIST:
             tracks = self._library.playlist_tracks(source)
         elif source == SOURCE_RECENT:
@@ -734,7 +848,9 @@ class MainWindow(QMainWindow):
     # --- devices --------------------------------------------------------
 
     def _open_sync_dialog(self) -> None:
-        SyncDialog(self._library, self._settings, self._run_in_background, self).exec()
+        SyncDialog(
+            self._library, self._settings, self._run_in_background, podcast_store=self._podcasts.store, parent=self
+        ).exec()
 
     # --- playlists ------------------------------------------------------
 
@@ -948,10 +1064,16 @@ class MainWindow(QMainWindow):
     def _refresh_up_next(self) -> None:
         upcoming_ids = self._queue.upcoming()
         found = self._library.tracks_by_ids(upcoming_ids[:500])
+        now_playing = self._current
+        if self._current_episode is not None:
+            # The panel only needs a title and a second line.
+            now_playing = SimpleNamespace(
+                title=self._current_episode.title, artist=self._current_episode.podcast_title
+            )
         upcoming = [found.get(track_id) for track_id in upcoming_ids[:500]]
         # Only the shown head needs real Track objects; the rest is counted.
         upcoming += [None] * (len(upcoming_ids) - len(upcoming))
-        self._up_next.set_queue(self._current, upcoming)
+        self._up_next.set_queue(now_playing, upcoming)
 
     def _on_up_next_visibility(self, visible: bool) -> None:
         self._up_next_button.setChecked(visible)
@@ -969,6 +1091,7 @@ class MainWindow(QMainWindow):
             self._status.showMessage("That file is missing — skipping", 4000)
             QTimer.singleShot(0, lambda: self._play_next(user_requested=True))
             return
+        self._leave_episode()
         self._current = track
         self._play_recorded = False
         note_current_track(track.path)
@@ -984,7 +1107,7 @@ class MainWindow(QMainWindow):
     def _toggle_play_pause(self) -> None:
         if self._focus_is_text_entry():
             return
-        if self._current is None:
+        if self._current is None and self._current_episode is None:
             if self._queue.upcoming():
                 self._play_next(user_requested=True)
                 return
@@ -1014,6 +1137,7 @@ class MainWindow(QMainWindow):
         self._play_track_id(self._queue.previous())
 
     def _stop(self) -> None:
+        self._leave_episode()
         self._player.stop()
         self._current = None
         self._player_bar.set_active(False)
@@ -1023,6 +1147,13 @@ class MainWindow(QMainWindow):
     def _on_position_changed(self, position_ms: int) -> None:
         duration_ms = self._player.duration()
         self._player_bar.set_progress(position_ms, duration_ms)
+        if (
+            self._current_episode is not None
+            and not self._pending_seek_ms
+            and abs(position_ms - self._last_position_save_ms) >= PODCAST_POSITION_SAVE_MS
+        ):
+            self._last_position_save_ms = position_ms
+            self._podcasts.save_position(self._current_episode.id, position_ms)
         if (
             self._current is not None
             and not self._play_recorded
@@ -1036,6 +1167,20 @@ class MainWindow(QMainWindow):
                 self._model.replace_track(updated)
 
     def _on_media_status_changed(self, status) -> None:
+        if (
+            self._pending_seek_ms
+            and status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia)
+            and self._player.isSeekable()
+        ):
+            # Resume a part-heard episode where it was left off.
+            self._player.setPosition(self._pending_seek_ms)
+            self._pending_seek_ms = 0
+        if status == QMediaPlayer.EndOfMedia and self._current_episode is not None:
+            self._podcasts.finished_playing(self._current_episode.id)
+            self._current_episode = None
+            self._player_bar.set_podcast_mode(False)
+            QTimer.singleShot(0, self._after_episode)
+            return
         if status == QMediaPlayer.EndOfMedia:
             # Don't swap the player's source from inside its own
             # end-of-media signal — the backend is still finishing that
@@ -1046,9 +1191,13 @@ class MainWindow(QMainWindow):
 
     def _on_playback_state_changed(self, state) -> None:
         self._player_bar.set_playing(state == QMediaPlayer.PlayingState)
+        if state != QMediaPlayer.PlayingState:
+            self._save_episode_position()
 
     def _on_player_error(self, _error, error_string: str) -> None:
-        if self._current is not None:
+        if self._current_episode is not None:
+            self._status.showMessage(f"Couldn't play {self._current_episode.title}: {error_string}", 6000)
+        elif self._current is not None:
             self._status.showMessage(f"Couldn't play {self._current.title}: {error_string}", 6000)
 
     def _on_volume_changed(self, volume: int) -> None:
@@ -1130,6 +1279,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        self._save_episode_position()
+        self._podcasts.shutdown()
         self._album_model.shutdown()
         self._player.stop()
         for thread in list(self._background_threads):

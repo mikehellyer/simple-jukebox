@@ -385,6 +385,54 @@ def plan_sync(
     return plan
 
 
+def plan_file_sync(dest: Path, items: Iterable[tuple[str, str]], remove_unselected: bool = True) -> SyncPlan:
+    """Plan copying plain (source path, device path) files — used for
+    podcast episodes, which live in their own folder on the device with
+    their own manifest. Same rules as songs: unchanged files aren't
+    recopied, the user's own files are never overwritten, and only files
+    this app copied are ever removed."""
+    dest = Path(dest)
+    plan = SyncPlan(dest=dest)
+    previously_synced = read_manifest(dest)
+    for source, rel in items:
+        if rel in plan.wanted:
+            continue
+        try:
+            size = os.path.getsize(source)
+        except OSError:
+            continue
+        try:
+            on_device = (dest / rel).stat().st_size
+        except OSError:
+            on_device = None
+        plan.wanted.add(rel)
+        if on_device == size or (on_device is not None and rel not in previously_synced):
+            plan.unchanged += 1
+        else:
+            plan.copies.append((source, rel))
+            plan.bytes_to_copy += size
+    if remove_unselected:
+        plan.deletes = sorted(previously_synced - plan.wanted)
+        for rel in plan.deletes:
+            try:
+                plan.bytes_to_free += (dest / rel).stat().st_size
+            except OSError:
+                pass
+    return plan
+
+
+def default_podcast_folder_for(music_folder: str) -> str:
+    """The Podcasts folder beside a device's Music folder — on Android
+    (e.g. a Walkman) files under Podcasts/ are treated as podcasts."""
+    if not music_folder:
+        return ""
+    music = Path(music_folder)
+    for name in ("Podcasts", "PODCASTS", "podcasts"):
+        if (music.parent / name).is_dir():
+            return str(music.parent / name)
+    return str(music.parent / "Podcasts")
+
+
 def free_space(dest: Path) -> Optional[int]:
     try:
         return shutil.disk_usage(dest).free
