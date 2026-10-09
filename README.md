@@ -38,6 +38,10 @@ Choose the entire library or particular playlists and artists; songs go into
 `Artist/Album` folders and playlists become `.m3u` files the player can read.
 Syncs are incremental, and "remove songs no longer selected" only ever deletes
 files Simple-Jukebox itself copied — it keeps a list of those on the device.
+Songs already on the device under a different name (copied by hand or by
+another app) are recognised by folder and file name, or failing that by their
+tags, and aren't copied again; playlists point at the copy that's there, and
+any duplicate an earlier sync made is removed (your copy is kept).
 Each device's choices are remembered for next time.
 
 ## Development setup

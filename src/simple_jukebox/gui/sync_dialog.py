@@ -6,11 +6,13 @@ even checking which songs are already on the player can take a while.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+from platformdirs import user_cache_dir
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -56,6 +58,10 @@ def format_bytes(count: int) -> str:
     return f"{size:,.1f} GB"
 
 
+def songs(count: int) -> str:
+    return f"{count:,} song" + ("" if count == 1 else "s")
+
+
 class _ProgressBridge(QObject):
     """Carries copy progress from the worker thread to the dialog."""
 
@@ -72,6 +78,7 @@ class SyncDialog(QDialog):
         self._run_in_background = run_in_background
         self._editing_name: Optional[str] = None  # name of the saved profile being edited
         self._busy = False
+        self._found_existing = 0  # from the last plan, for the "done" message
         self._cancel = threading.Event()
         self._bridge = _ProgressBridge()
         self._bridge.progress.connect(self._on_progress, Qt.QueuedConnection)
@@ -153,6 +160,15 @@ class SyncDialog(QDialog):
             "Only ever removes files Simple-Jukebox put on the device — never other music or files."
         )
         layout.addWidget(self._remove_unselected)
+        self._find_existing = QCheckBox(
+            "Don't copy songs that are already on the device under a different name"
+        )
+        self._find_existing.setToolTip(
+            "Recognises songs put on the device some other way (by hand, or another app) "
+            "by their folder and file name, or failing that their tags — so they aren't copied twice. "
+            "Playlists then point at the copy that's already there."
+        )
+        layout.addWidget(self._find_existing)
 
         self._summary = QLabel("")
         self._summary.setWordWrap(True)
@@ -214,6 +230,7 @@ class SyncDialog(QDialog):
         self._set_checked(self._artist_list, set(profile.artists))
         self._copy_playlists.setChecked(profile.copy_playlists)
         self._remove_unselected.setChecked(profile.remove_unselected)
+        self._find_existing.setChecked(profile.find_existing)
         self._on_mode_changed()
         self._status.setText("")
 
@@ -226,6 +243,7 @@ class SyncDialog(QDialog):
             artists=self._checked(self._artist_list),
             copy_playlists=self._copy_playlists.isChecked(),
             remove_unselected=self._remove_unselected.isChecked(),
+            find_existing=self._find_existing.isChecked(),
         )
 
     def _save_profile(self) -> bool:
@@ -334,7 +352,7 @@ class SyncDialog(QDialog):
                 size += os.path.getsize(path)
             except OSError:
                 pass
-        text = f"Selected: {len(unique):,} songs, {format_bytes(size)}."
+        text = f"Selected: {songs(len(unique))}, {format_bytes(size)}."
         path = self._path.text().strip()
         if path and Path(path).is_dir():
             free = free_space(Path(path))
@@ -351,6 +369,7 @@ class SyncDialog(QDialog):
         for widget in (
             self._device_combo, self._remove_button, self._name, self._path, self._detected_button,
             self._whole_library, self._chosen, self._copy_playlists, self._remove_unselected,
+            self._find_existing,
             self._sync_button, self._close_button,
         ):
             widget.setEnabled(not busy)
@@ -384,11 +403,24 @@ class SyncDialog(QDialog):
         self._set_busy(True)
         self._progress.setRange(0, 0)  # busy, until we know the total
         self._status.setText("Checking what's already on the device…")
-        remove = profile.remove_unselected
+        remove, find_existing = profile.remove_unselected, profile.find_existing
+        cache_path = self._tag_cache_path(dest)
+        bridge = self._bridge
         self._run_in_background(
-            lambda: plan_sync(dest, tracks, playlists, remove_unselected=remove),
+            lambda: plan_sync(
+                dest, tracks, playlists,
+                remove_unselected=remove, find_existing=find_existing,
+                progress=bridge.progress.emit, tag_cache_path=cache_path,
+            ),
             self._on_planned,
         )
+
+    @staticmethod
+    def _tag_cache_path(dest: Path) -> Path:
+        """Tags of songs already on a device, cached on this computer so
+        resyncs don't read them over USB again — one file per device folder."""
+        key = hashlib.sha1(str(dest).encode("utf-8")).hexdigest()[:16]
+        return Path(user_cache_dir("Simple-Jukebox")) / "device-tags" / f"{key}.json"
 
     def _on_planned(self, plan: SyncPlan) -> None:
         free = free_space(plan.dest)
@@ -403,17 +435,27 @@ class SyncDialog(QDialog):
                 f"{format_bytes(free)} free. Choose fewer playlists or artists.",
             )
             return
-        if not plan.copies and not plan.deletes and not plan.playlists:
+        if not plan.copies and not plan.all_deletes and not plan.playlists:
             self._set_busy(False)
-            self._status.setText(f"Already up to date — {plan.unchanged:,} songs on the device.")
+            self._status.setText(f"Already up to date — {songs(plan.song_count)} on the device.")
             return
-        if plan.deletes:
+        if plan.all_deletes:
+            reasons = []
+            if plan.deletes:
+                reasons.append(
+                    f"• {songs(len(plan.deletes))} copied by an earlier sync no longer selected."
+                )
+            if plan.duplicate_deletes:
+                reasons.append(
+                    f"• {songs(len(plan.duplicate_deletes))} copied by an earlier sync that duplicate "
+                    "songs you already had on the device — your copies are kept."
+                )
             answer = QMessageBox.question(
                 self,
                 "Remove Songs?",
-                f"{len(plan.deletes):,} songs copied by an earlier sync are no longer selected "
-                f"and will be removed from the device ({format_bytes(plan.bytes_to_free)}).\n\n"
-                "Continue?",
+                "\n".join(reasons)
+                + f"\n\nThese will be removed from the device ({format_bytes(plan.bytes_to_free)}). "
+                "Only files Simple-Jukebox copied are ever removed.\n\nContinue?",
             )
             if answer != QMessageBox.Yes:
                 self._set_busy(False)
@@ -421,10 +463,11 @@ class SyncDialog(QDialog):
                 return
 
         self._status.setText(
-            f"Copying {len(plan.copies):,} songs ({format_bytes(plan.bytes_to_copy)})"
-            + (f", removing {len(plan.deletes):,}" if plan.deletes else "")
+            f"Copying {songs(len(plan.copies))} ({format_bytes(plan.bytes_to_copy)})"
+            + (f", removing {len(plan.all_deletes):,}" if plan.all_deletes else "")
             + "…"
         )
+        self._found_existing = plan.found_existing
         bridge, cancel = self._bridge, self._cancel
         self._run_in_background(
             lambda: run_sync(plan, progress=bridge.progress.emit, cancelled=cancel.is_set),
@@ -440,12 +483,17 @@ class SyncDialog(QDialog):
     def _on_synced(self, result) -> None:
         self._set_busy(False)
         if result.cancelled:
-            text = f"Sync cancelled after copying {result.copied:,} songs. Sync again to finish."
+            text = f"Sync cancelled after copying {songs(result.copied)}. Sync again to finish."
         else:
-            text = f"Done — copied {result.copied:,} songs"
+            text = f"Done — copied {songs(result.copied)}"
             if result.deleted:
                 text += f", removed {result.deleted:,}"
             text += "."
+            if self._found_existing:
+                text += (
+                    f" {songs(self._found_existing)} already on the device under other names "
+                    "weren't copied again."
+                )
         if result.failed:
             first, error = result.failed[0]
             text += f"\n{len(result.failed):,} couldn't be copied (first: {first} — {error})."

@@ -7,7 +7,8 @@ and playlists as .m3u files beside them, which Android-based Walkmans and
 Sailfish phones both pick up.
 
 Sync is one-way and incremental: a song already on the device at the same
-size isn't copied again. A manifest file in the destination folder lists
+size isn't copied again, and nor is one already there under a different
+name (see "recognising songs already on the device" below). A manifest file in the destination folder lists
 everything this app has put there, so "remove songs that are no longer
 selected" only ever deletes files Simple-Jukebox itself copied — never
 music the user put on the device some other way.
@@ -66,11 +67,14 @@ def playlist_file_name(name: str) -> str:
     return safe_name(name, "Playlist") + ".m3u"
 
 
-def m3u_text(tracks: list[Track]) -> str:
+def m3u_text(tracks: list[Track], location: Optional[dict[str, str]] = None) -> str:
+    """location maps a track's library path to where it actually is on the
+    device, for songs found there under a different name."""
+    location = location or {}
     lines = ["#EXTM3U"]
     for track in tracks:
         lines.append(f"#EXTINF:{int(round(track.duration))},{track.artist} - {track.title}")
-        lines.append(device_path_for(track))
+        lines.append(location.get(track.path, device_path_for(track)))
     return "\n".join(lines) + "\n"
 
 
@@ -91,6 +95,166 @@ def write_manifest(dest: Path, files: Iterable[str]) -> None:
     (dest / MANIFEST_NAME).write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
 
+# --- recognising songs already on the device --------------------------------
+#
+# A song the user put on the player some other way (by hand, another app)
+# won't be at the path we'd use, so it's recognised by name instead:
+# first by its album folder + file name (free — just a directory listing),
+# then, for files whose names don't match anything, by reading their tags
+# (slower over USB, so only done when needed).
+
+DURATION_TOLERANCE_SECONDS = 3
+_AUDIO_EXTENSIONS = {".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".aac", ".wav", ".wma", ".aiff", ".aif"}
+_LEADING_NUMBER = re.compile(r"^\s*(?:\d{1,2}\s*[-.]\s*)?\d{1,3}\s*(?:[-._)]\s*|\s+)")
+
+
+def normalize(text: str) -> str:
+    """Comparable form of a name: case, accents, punctuation, "&"/"and"
+    and a leading "The" don't matter."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    if text.startswith("the "):
+        text = text[4:]
+    return text
+
+
+def title_from_filename(stem: str, artist_hint: str = "") -> str:
+    """"01 - Dream Police" / "1-01. Dream Police" / "03 Cheap Trick - Dream
+    Police" → "Dream Police"."""
+    title = _LEADING_NUMBER.sub("", stem, count=1) or stem
+    if " - " in title and artist_hint:
+        first, rest = title.split(" - ", 1)
+        if normalize(first) == normalize(artist_hint):
+            title = rest
+    return title
+
+
+@dataclass
+class _DeviceSong:
+    rel: str
+    tags_read: bool = False
+    artist: str = ""
+    album: str = ""
+    title: str = ""
+    duration: float = 0.0
+
+
+def _device_songs(dest: Path, exclude: set[str]) -> list[_DeviceSong]:
+    """Audio files under dest that this app didn't put there."""
+    songs = []
+    for dirpath, dirnames, filenames in os.walk(dest):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            if Path(name).suffix.lower() not in _AUDIO_EXTENSIONS:
+                continue
+            rel = Path(dirpath, name).relative_to(dest).as_posix()
+            if rel not in exclude:
+                songs.append(_DeviceSong(rel=rel))
+    return songs
+
+
+def _name_key(album: str, title: str) -> tuple[str, str]:
+    return normalize(album), normalize(title)
+
+
+def load_tag_cache(path: Optional[Path]) -> dict:
+    if path is None:
+        return {}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_tag_cache(path: Optional[Path], cache: dict) -> None:
+    if path is None:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(cache), encoding="utf-8")
+    except OSError:
+        pass  # only a speed-up
+
+
+class _ExistingSongs:
+    """Finds a library track among the songs already on the device.
+
+    Tags read from device files are cached (keyed by path and size) so
+    that later syncs don't have to read them over USB again."""
+
+    def __init__(self, dest: Path, songs: list[_DeviceSong], tag_reader, progress=None, cache_path=None):
+        self._dest = dest
+        self._songs = songs
+        self._tag_reader = tag_reader
+        self._progress = progress
+        self._cache_path = cache_path
+        self._by_name: dict[tuple[str, str], str] = {}
+        for song in songs:
+            parts = song.rel.split("/")
+            album = parts[-2] if len(parts) >= 2 else ""
+            artist_hint = parts[-3] if len(parts) >= 3 else ""
+            title = title_from_filename(Path(parts[-1]).stem, artist_hint)
+            self._by_name.setdefault(_name_key(album, title), song.rel)
+        self._name_matched: set[str] = set()
+        self._by_tags: Optional[dict[tuple[str, str], list[_DeviceSong]]] = None
+
+    def find(self, track: Track) -> Optional[str]:
+        rel = self._by_name.get(_name_key(track.album, track.title))
+        if rel is not None:
+            self._name_matched.add(rel)
+            return rel
+        return None
+
+    def find_by_tags(self, track: Track) -> Optional[str]:
+        if self._by_tags is None:
+            self._read_tags()
+        for song in self._by_tags.get((normalize(track.artist), normalize(track.title)), []):
+            same_album = normalize(song.album) == normalize(track.album)
+            close_length = (
+                song.duration > 0 and track.duration > 0
+                and abs(song.duration - track.duration) <= DURATION_TOLERANCE_SECONDS
+            )
+            if same_album or close_length:
+                return song.rel
+        return None
+
+    def _read_tags(self) -> None:
+        self._by_tags = {}
+        old_cache = load_tag_cache(self._cache_path)
+        new_cache: dict = {}
+        pending = [s for s in self._songs if s.rel not in self._name_matched]
+        for index, song in enumerate(pending):
+            try:
+                size = (self._dest / song.rel).stat().st_size
+            except OSError:
+                continue
+            cached = old_cache.get(song.rel)
+            if isinstance(cached, list) and len(cached) == 6 and cached[0] == size:
+                entry = cached
+            else:
+                if self._progress is not None:
+                    self._progress(index, len(pending), song.rel)
+                info = self._tag_reader(self._dest / song.rel)
+                entry = (
+                    [size, info.artist, info.album_artist, info.album, info.title, info.duration]
+                    if info is not None else [size, "", "", "", "", 0.0]
+                )
+            new_cache[song.rel] = entry
+            _, artist, album_artist, album, title, duration = entry
+            if not title:
+                continue
+            song.tags_read = True
+            song.artist, song.album, song.title, song.duration = artist, album, title, float(duration)
+            for name in {artist, album_artist}:
+                self._by_tags.setdefault((normalize(name), normalize(title)), []).append(song)
+        save_tag_cache(self._cache_path, new_cache)
+
+
 # --- planning --------------------------------------------------------------
 
 
@@ -98,16 +262,22 @@ def write_manifest(dest: Path, files: Iterable[str]) -> None:
 class SyncPlan:
     dest: Path
     copies: list[tuple[str, str]] = field(default_factory=list)  # (source path, device path)
-    deletes: list[str] = field(default_factory=list)  # device paths we put there earlier
+    deletes: list[str] = field(default_factory=list)  # device paths we put there earlier, now unselected
+    duplicate_deletes: list[str] = field(default_factory=list)  # our earlier copies of songs the user already had
     playlists: dict[str, str] = field(default_factory=dict)  # .m3u file name → contents
     unchanged: int = 0
+    found_existing: int = 0  # selected songs already on the device under another name
     bytes_to_copy: int = 0
     bytes_to_free: int = 0
     wanted: set[str] = field(default_factory=set)  # every device path the sync leaves in place
 
     @property
     def song_count(self) -> int:
-        return len(self.copies) + self.unchanged
+        return len(self.copies) + self.unchanged + self.found_existing
+
+    @property
+    def all_deletes(self) -> list[str]:
+        return self.duplicate_deletes + self.deletes
 
 
 def plan_sync(
@@ -115,13 +285,57 @@ def plan_sync(
     tracks: Iterable[Track],
     playlists: Optional[dict[str, list[Track]]] = None,
     remove_unselected: bool = True,
+    find_existing: bool = True,
+    tag_reader: Optional[Callable] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    tag_cache_path: Optional[Path] = None,
 ) -> SyncPlan:
-    """Work out what to copy and delete, without touching the device."""
+    """Work out what to copy and delete, without changing the device.
+
+    With find_existing, a selected song that's already on the device under
+    a different name (copied by hand or by another app) isn't copied again
+    — and if an earlier sync already made a second copy of it, that copy
+    is removed. progress(done, total, path) reports tag reading, the slow
+    part of that check.
+    """
     dest = Path(dest)
     plan = SyncPlan(dest=dest)
     previously_synced = read_manifest(dest)
+    existing = None
+    if find_existing:
+        if tag_reader is None:
+            from simple_jukebox.core.tags import read_track as tag_reader
+        existing = _ExistingSongs(
+            dest, _device_songs(dest, previously_synced), tag_reader, progress, tag_cache_path
+        )
 
-    seen: set[str] = set()
+    seen: set[str] = set()  # our device paths of selected songs
+    location: dict[str, str] = {}  # library path → where the song is on the device
+    needs_tag_check: list[tuple[Track, str, int, Optional[int]]] = []
+
+    def keep(track: Track, rel: str) -> None:
+        plan.unchanged += 1
+        location[track.path] = rel
+        plan.wanted.add(rel)
+
+    def ours(track: Track, rel: str, size: int, on_device: Optional[int]) -> None:
+        """Our own copy at our path: keep it if current, else (re)copy."""
+        if on_device == size:
+            keep(track, rel)
+        else:
+            plan.copies.append((track.path, rel))
+            plan.bytes_to_copy += size
+            location[track.path] = rel
+            plan.wanted.add(rel)
+
+    def use_existing(track: Track, rel: str, our_rel: str) -> None:
+        plan.found_existing += 1
+        location[track.path] = rel
+        plan.wanted.add(rel)
+        if our_rel in previously_synced and (dest / our_rel).exists():
+            # An earlier sync made a second copy of a song the user had.
+            plan.duplicate_deletes.append(our_rel)
+
     for track in tracks:
         rel = device_path_for(track)
         if rel in seen:
@@ -131,34 +345,43 @@ def plan_sync(
             source_size = os.path.getsize(track.path)
         except OSError:
             continue  # gone from disk since the last library scan
-        target = dest / rel
+
+        found = existing.find(track) if existing is not None else None
+        if found is not None:
+            use_existing(track, found, rel)
+            continue
         try:
-            on_device = target.stat().st_size
+            on_device = (dest / rel).stat().st_size
         except OSError:
             on_device = None
-        if on_device == source_size:
-            plan.unchanged += 1
-        elif on_device is not None and rel not in previously_synced:
-            # Already there, but not put there by us (copied by hand, or
-            # another app) — use it as is rather than overwrite it.
-            plan.unchanged += 1
+        if on_device is not None and rel not in previously_synced:
+            keep(track, rel)  # the user's own file at exactly our path — never overwritten
+        elif existing is not None:
+            needs_tag_check.append((track, rel, source_size, on_device))
         else:
-            plan.copies.append((track.path, rel))
-            plan.bytes_to_copy += source_size
+            ours(track, rel, source_size, on_device)
+
+    # Only read tags (slow over USB, and cached) for songs no file name matched.
+    for track, rel, source_size, on_device in needs_tag_check:
+        found = existing.find_by_tags(track)
+        if found is not None:
+            use_existing(track, found, rel)
+        else:
+            ours(track, rel, source_size, on_device)
 
     for name, playlist_tracks in (playlists or {}).items():
         # Only list songs that are actually on the device after the sync.
-        present = [t for t in playlist_tracks if device_path_for(t) in seen]
-        plan.playlists[playlist_file_name(name)] = m3u_text(present)
+        present = [t for t in playlist_tracks if t.path in location]
+        plan.playlists[playlist_file_name(name)] = m3u_text(present, location)
 
-    plan.wanted = seen | set(plan.playlists)
+    plan.wanted |= set(plan.playlists)
     if remove_unselected:
-        for rel in sorted(previously_synced - plan.wanted):
-            plan.deletes.append(rel)
-            try:
-                plan.bytes_to_free += (dest / rel).stat().st_size
-            except OSError:
-                pass
+        plan.deletes = sorted(previously_synced - plan.wanted - set(plan.duplicate_deletes))
+    for rel in plan.all_deletes:
+        try:
+            plan.bytes_to_free += (dest / rel).stat().st_size
+        except OSError:
+            pass
     return plan
 
 
@@ -226,7 +449,8 @@ def run_sync(
     dest = plan.dest
     result = SyncResult()
     manifest = read_manifest(dest)
-    total = len(plan.deletes) + len(plan.copies) + len(plan.playlists)
+    deletes = plan.all_deletes
+    total = len(deletes) + len(plan.copies) + len(plan.playlists)
     done = 0
 
     def step(label: str) -> None:
@@ -237,7 +461,7 @@ def run_sync(
 
     try:
         # Deletes first, to make room.
-        for rel in plan.deletes:
+        for rel in deletes:
             if cancelled():
                 raise SyncCancelled()
             step(rel)
@@ -250,7 +474,7 @@ def run_sync(
                 continue
             manifest.discard(rel)
             result.deleted += 1
-        _prune_empty_dirs(dest, plan.deletes)
+        _prune_empty_dirs(dest, deletes)
 
         for source, rel in plan.copies:
             if cancelled():

@@ -25,6 +25,7 @@ class DeviceProfile:
     artists: list[str] = field(default_factory=list)
     copy_playlists: bool = True
     remove_unselected: bool = True
+    find_existing: bool = True  # skip songs already on the device under another name
 
     @classmethod
     def from_dict(cls, data) -> Optional["DeviceProfile"]:
@@ -38,6 +39,7 @@ class DeviceProfile:
             artists=[a for a in data.get("artists", []) if isinstance(a, str)],
             copy_playlists=bool(data.get("copy_playlists", True)),
             remove_unselected=bool(data.get("remove_unselected", True)),
+            find_existing=bool(data.get("find_existing", True)),
         )
 
 
