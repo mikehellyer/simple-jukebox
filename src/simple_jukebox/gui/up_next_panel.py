@@ -43,8 +43,15 @@ class _UpNextList(QListWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.MoveAction)
+        # Styling ::item at all makes Qt stop drawing the selection the
+        # normal way, and some themes then paint selected text in the same
+        # colour as its background — so the selected colours are spelled
+        # out too, from the theme's own palette.
         self.setStyleSheet(
             "QListWidget::item { padding: 4px 2px; border-bottom: 1px solid rgba(127, 127, 127, 0.18); }"
+            "QListWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); }"
+            "QListWidget::item:selected:!active { background: rgba(127, 127, 127, 0.32); color: palette(text); }"
+            "QListWidget::item:hover:!selected { background: rgba(127, 127, 127, 0.12); }"
         )
 
     def _insertion_row(self, event) -> int:
