@@ -6,8 +6,8 @@ import datetime
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
+from PySide6.QtCore import QBuffer, QByteArray, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -52,6 +52,15 @@ class PodcastsPage(QWidget):
         self._manager = manager
         self._filter = ""
         self._rows: dict[int, int] = {}  # episode id → table row
+        self._art_cache: dict[tuple, Optional[QPixmap]] = {}
+        # Rebuilding the page is the costly part of a podcast refresh, so
+        # it only happens while the page is on screen — and a burst of
+        # changes (several feeds updating at once) becomes one rebuild.
+        self._dirty = False
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(150)
+        self._refresh_timer.timeout.connect(self.refresh)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -155,11 +164,30 @@ class PodcastsPage(QWidget):
         split.addWidget(right)
         split.setSizes([260, 900])
 
-        manager.changed.connect(self.refresh)
+        manager.changed.connect(self._schedule_refresh)
         manager.download_progress.connect(self._on_progress)
-        manager.subscribed.connect(self._select_podcast)
-        manager.artwork_ready.connect(lambda _id: self.refresh())
+        manager.subscribed.connect(self._on_subscribed)
+        manager.artwork_ready.connect(self._on_artwork_ready)
+        self._dirty = True  # built the first time it's shown
+
+    def _schedule_refresh(self) -> None:
+        if self.isVisible():
+            self._refresh_timer.start()
+        else:
+            self._dirty = True
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._dirty:
+            self.refresh()
+
+    def _on_subscribed(self, podcast_id: int) -> None:
         self.refresh()
+        self._select_podcast(podcast_id)
+
+    def _on_artwork_ready(self, podcast_id: int) -> None:
+        self._art_cache = {k: v for k, v in self._art_cache.items() if k[0] != podcast_id}
+        self._schedule_refresh()
 
     # --- shows ----------------------------------------------------------
 
@@ -174,13 +202,32 @@ class PodcastsPage(QWidget):
                 return
 
     def _artwork(self, podcast_id: int, size: int) -> Optional[QPixmap]:
+        """Show artwork at the size it's displayed. Feeds often supply
+        3000px images; decoding one is slow, so each is decoded once —
+        straight to the small size — and remembered."""
+        key = (podcast_id, size)
+        if key in self._art_cache:
+            return self._art_cache[key]
+        pixmap = None
         data = self._manager.artwork_bytes(podcast_id)
-        pixmap = QPixmap()
-        if data and pixmap.loadFromData(data):
-            return pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        return None
+        if data:
+            buffer = QBuffer()
+            buffer.setData(QByteArray(data))
+            buffer.open(QBuffer.ReadOnly)
+            reader = QImageReader(buffer)
+            original = reader.size()
+            if original.isValid() and original.width() > 0:
+                # JPEG decoders can skip most of the work at a reduced size.
+                reader.setScaledSize(original.scaled(size * 2, size * 2, Qt.KeepAspectRatio))
+            image = reader.read()
+            if not image.isNull():
+                pixmap = QPixmap.fromImage(image).scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._art_cache[key] = pixmap
+        return pixmap
 
     def refresh(self) -> None:
+        self._dirty = False
+        self._refresh_timer.stop()
         current = self._podcast_id()
         podcasts = self._manager.store.podcasts()
         self._shows.blockSignals(True)
