@@ -3,7 +3,7 @@ playing, previous/play/next, a seek bar, shuffle/repeat and volume."""
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -15,8 +15,14 @@ from PySide6.QtWidgets import (
 )
 
 from simple_jukebox.core.text import format_duration
+from simple_jukebox.gui.icons import transport_icon
 
 ART_SIZE = 72
+SKIP_BUTTON_SIZE = QSize(54, 42)
+PLAY_BUTTON_SIZE = QSize(64, 50)
+SKIP_ICON_SIZE = 22
+PLAY_ICON_SIZE = 28
+PODCAST_SKIP_STYLE = "QPushButton { font-size: 15px; font-weight: 600; }"
 REPEAT_LABELS = {"off": "🔁 Off", "all": "🔁 All", "one": "🔂 One"}
 NEXT_REPEAT = {"off": "all", "all": "one", "one": "off"}
 
@@ -66,14 +72,22 @@ class PlayerBar(QWidget):
         outer.addWidget(self._art)
 
         transport = QHBoxLayout()
-        self._previous_button = QPushButton("⏮")
+        self._previous_button = QPushButton()
         self._previous_button.clicked.connect(self.previous_requested)
-        self._play_pause_button = QPushButton("▶")
+        self._play_pause_button = QPushButton()
         self._play_pause_button.clicked.connect(self.play_pause_requested)
-        self._next_button = QPushButton("⏭")
+        self._next_button = QPushButton()
         self._next_button.clicked.connect(self.next_requested)
+        # Big enough to hit easily and to read at a glance; play/pause
+        # biggest, as on most players.
+        for button in (self._previous_button, self._next_button):
+            button.setFixedSize(SKIP_BUTTON_SIZE)
+            button.setIconSize(QSize(SKIP_ICON_SIZE, SKIP_ICON_SIZE))
+        self._play_pause_button.setFixedSize(PLAY_BUTTON_SIZE)
+        self._play_pause_button.setIconSize(QSize(PLAY_ICON_SIZE, PLAY_ICON_SIZE))
+        self._podcast_mode = False
+        self._playing = False
         for button in (self._previous_button, self._play_pause_button, self._next_button):
-            button.setFixedWidth(44)
             transport.addWidget(button)
         outer.addLayout(transport)
 
@@ -126,6 +140,7 @@ class PlayerBar(QWidget):
         self._volume.valueChanged.connect(self.volume_changed)
         outer.addWidget(self._volume)
 
+        self.set_podcast_mode(False)  # draws the previous/next icons
         self.set_active(False)
 
     # --- state from the window -----------------------------------------
@@ -154,8 +169,13 @@ class PlayerBar(QWidget):
             self.set_progress(0, 0)
             self.set_playing(False)
 
+    def _icon(self, kind: str, size: int):
+        return transport_icon(kind, size, self.palette().color(self.foregroundRole()))
+
     def set_playing(self, playing: bool) -> None:
-        self._play_pause_button.setText("⏸" if playing else "▶")
+        self._playing = playing
+        self._play_pause_button.setIcon(self._icon("pause" if playing else "play", PLAY_ICON_SIZE))
+        self._play_pause_button.setToolTip("Pause" if playing else "Play")
 
     def set_progress(self, position_ms: int, duration_ms: int) -> None:
         if duration_ms > 0:
@@ -172,16 +192,31 @@ class PlayerBar(QWidget):
     def set_podcast_mode(self, podcast: bool) -> None:
         """While an episode plays, ⏮/⏭ skip back 15s / forward 30s — the
         usual podcast controls — instead of changing track."""
+        self._podcast_mode = podcast
+        style = PODCAST_SKIP_STYLE if podcast else ""
+        self._previous_button.setStyleSheet(style)
+        self._next_button.setStyleSheet(style)
         if podcast:
+            self._previous_button.setIcon(QIcon())
             self._previous_button.setText("−15")
             self._previous_button.setToolTip("Back 15 seconds")
+            self._next_button.setIcon(QIcon())
             self._next_button.setText("+30")
             self._next_button.setToolTip("Forward 30 seconds")
         else:
-            self._previous_button.setText("⏮")
+            self._previous_button.setText("")
+            self._previous_button.setIcon(self._icon("previous", SKIP_ICON_SIZE))
             self._previous_button.setToolTip("Previous track")
-            self._next_button.setText("⏭")
+            self._next_button.setText("")
+            self._next_button.setIcon(self._icon("next", SKIP_ICON_SIZE))
             self._next_button.setToolTip("Next track")
+
+    def changeEvent(self, event) -> None:
+        # Light/dark theme switched: repaint the icons in the new text colour.
+        if event.type() == event.Type.PaletteChange:
+            self.set_playing(self._playing)
+            self.set_podcast_mode(self._podcast_mode)
+        super().changeEvent(event)
 
     def set_volume(self, volume: int) -> None:
         self._volume.setValue(volume)

@@ -45,6 +45,8 @@ from simple_jukebox.core.self_update import (
 from simple_jukebox.core.settings import SettingsStore
 from simple_jukebox.core.updater import API_TIMEOUT_SECONDS, check_for_update
 from simple_jukebox.gui.album_grid import AlbumGridModel, AlbumGridView
+from simple_jukebox.core.mpris import track_object_path
+from simple_jukebox.gui.media_controls import MediaControls
 from simple_jukebox.gui.player_bar import PlayerBar
 from simple_jukebox.gui.podcast_manager import PodcastManager
 from simple_jukebox.gui.podcasts_page import PodcastsPage
@@ -152,6 +154,26 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menus()
 
+        self._now_playing_art: Optional[bytes] = None
+        self._media = MediaControls(self)
+        self._media.play_pause.connect(self._play_pause)
+        self._media.play.connect(self._play)
+        self._media.pause.connect(self._player.pause)
+        self._media.stop.connect(self._stop)
+        self._media.next.connect(self._on_next_clicked)
+        self._media.previous.connect(self._on_previous_clicked)
+        self._media.seek_by.connect(lambda ms: self._seek_to(self._player.position() + ms))
+        self._media.seek_to.connect(self._seek_to)
+        self._media.raise_window.connect(self._bring_to_front)
+        self._media.quit.connect(self.close)
+        self._media.shuffle_requested.connect(self._player_bar.set_shuffle)  # its toggle does the rest
+        self._media.repeat_requested.connect(self._set_repeat_from_outside)
+        self._media.volume_requested.connect(self._player_bar.set_volume)  # its slider does the rest
+        self._media.set_shuffle(self._settings.shuffle)
+        self._media.set_repeat(self._settings.repeat)
+        self._media.set_volume(self._settings.volume)
+        self._player.durationChanged.connect(self._media.set_length)
+
         self._player_bar.set_volume(self._settings.volume)
         self._audio_output.setVolume(self._settings.volume / 100)
         self._player_bar.set_shuffle(self._settings.shuffle)
@@ -181,7 +203,7 @@ class MainWindow(QMainWindow):
         self._player_bar.play_pause_requested.connect(self._toggle_play_pause)
         self._player_bar.previous_requested.connect(self._on_previous_clicked)
         self._player_bar.next_requested.connect(self._on_next_clicked)
-        self._player_bar.seek_requested.connect(self._player.setPosition)
+        self._player_bar.seek_requested.connect(self._seek_to)
         self._player_bar.volume_changed.connect(self._on_volume_changed)
         self._player_bar.shuffle_toggled.connect(self._on_shuffle_toggled)
         self._player_bar.repeat_changed.connect(self._on_repeat_changed)
@@ -633,7 +655,9 @@ class MainWindow(QMainWindow):
         self._player_bar.set_podcast_mode(True)
         self._player_bar.set_now_playing(episode.title, episode.podcast_title)
         self._player_bar.set_art(art)
+        self._now_playing_art = art
         self._refresh_up_next()
+        self._update_media_now_playing()
 
     def _save_episode_position(self) -> None:
         if self._current_episode is not None:
@@ -659,7 +683,7 @@ class MainWindow(QMainWindow):
 
     def _on_previous_clicked(self) -> None:
         if self._current_episode is not None:
-            self._player.setPosition(max(0, self._player.position() - PODCAST_SKIP_BACK_MS))
+            self._seek_to(max(0, self._player.position() - PODCAST_SKIP_BACK_MS))
         else:
             self._play_previous()
 
@@ -667,7 +691,7 @@ class MainWindow(QMainWindow):
         if self._current_episode is not None:
             duration = self._player.duration()
             target = self._player.position() + PODCAST_SKIP_FORWARD_MS
-            self._player.setPosition(min(target, duration - 1000) if duration > 0 else target)
+            self._seek_to(min(target, duration - 1000) if duration > 0 else target)
         else:
             self._play_next(user_requested=True)
 
@@ -1074,6 +1098,11 @@ class MainWindow(QMainWindow):
         # Only the shown head needs real Track objects; the rest is counted.
         upcoming += [None] * (len(upcoming_ids) - len(upcoming))
         self._up_next.set_queue(now_playing, upcoming)
+        loaded = self._current is not None or self._current_episode is not None
+        self._media.set_can_skip(
+            can_next=bool(upcoming_ids) or self._current_episode is not None,
+            can_previous=loaded,
+        )
 
     def _on_up_next_visibility(self, visible: bool) -> None:
         self._up_next_button.setChecked(visible)
@@ -1100,13 +1129,18 @@ class MainWindow(QMainWindow):
         self._player_bar.set_active(True)
         subtitle = " — ".join(part for part in (track.artist, track.album) if part)
         self._player_bar.set_now_playing(track.title, subtitle)
-        self._player_bar.set_art(find_art(Path(track.path)))
+        self._now_playing_art = find_art(Path(track.path))
+        self._player_bar.set_art(self._now_playing_art)
         self._model.set_playing(track.id)
         self._refresh_up_next()
+        self._update_media_now_playing()
 
     def _toggle_play_pause(self) -> None:
         if self._focus_is_text_entry():
-            return
+            return  # Space is being typed into the search box
+        self._play_pause()
+
+    def _play_pause(self) -> None:
         if self._current is None and self._current_episode is None:
             if self._queue.upcoming():
                 self._play_next(user_requested=True)
@@ -1122,6 +1156,58 @@ class MainWindow(QMainWindow):
         else:
             self._player.play()
 
+    def _play(self) -> None:
+        if self._current is None and self._current_episode is None:
+            self._play_pause()  # starts something
+        elif self._player.playbackState() != QMediaPlayer.PlayingState:
+            self._player.play()
+
+    def _seek_to(self, position_ms: int) -> None:
+        """Every jump in position goes through here, so the desktop's
+        media controls (MPRIS "Seeked") follow it too."""
+        position_ms = max(0, int(position_ms))
+        duration = self._player.duration()
+        if duration > 0:
+            position_ms = min(position_ms, duration)
+        self._player.setPosition(position_ms)
+        self._media.seeked(position_ms)
+
+    def _bring_to_front(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _set_repeat_from_outside(self, repeat: str) -> None:
+        self._player_bar.set_repeat(repeat)
+        self._on_repeat_changed(repeat)
+
+    def _update_media_now_playing(self) -> None:
+        episode, track = self._current_episode, self._current
+        if episode is not None:
+            self._media.set_now_playing(
+                track_object_path("episode", episode.id),
+                title=episode.title,
+                artist=episode.podcast_title,
+                album=episode.podcast_title,
+                length_ms=episode.duration * 1000,
+                art=self._now_playing_art,
+                url=episode.audio_url,
+            )
+        elif track is not None:
+            self._media.set_now_playing(
+                track_object_path("track", track.id),
+                title=track.title,
+                artist=track.artist,
+                album=track.album,
+                album_artist=track.album_artist,
+                length_ms=int(track.duration * 1000),
+                art=self._now_playing_art,
+                track_number=track.track_number,
+                url=QUrl.fromLocalFile(track.path).toString(),
+            )
+        else:
+            self._media.set_now_playing(None)
+
     def _focus_is_text_entry(self) -> bool:
         return self._search.hasFocus()
 
@@ -1132,7 +1218,7 @@ class MainWindow(QMainWindow):
         # Like every music player: "previous" restarts the song unless
         # you're right at its start.
         if self._player.position() > 3000:
-            self._player.setPosition(0)
+            self._seek_to(0)
             return
         self._play_track_id(self._queue.previous())
 
@@ -1140,6 +1226,8 @@ class MainWindow(QMainWindow):
         self._leave_episode()
         self._player.stop()
         self._current = None
+        self._now_playing_art = None
+        self._media.set_now_playing(None)
         self._player_bar.set_active(False)
         self._model.set_playing(None)
         self._refresh_up_next()
@@ -1147,6 +1235,7 @@ class MainWindow(QMainWindow):
     def _on_position_changed(self, position_ms: int) -> None:
         duration_ms = self._player.duration()
         self._player_bar.set_progress(position_ms, duration_ms)
+        self._media.set_position(position_ms)
         if (
             self._current_episode is not None
             and not self._pending_seek_ms
@@ -1173,8 +1262,8 @@ class MainWindow(QMainWindow):
             and self._player.isSeekable()
         ):
             # Resume a part-heard episode where it was left off.
-            self._player.setPosition(self._pending_seek_ms)
-            self._pending_seek_ms = 0
+            resume_at, self._pending_seek_ms = self._pending_seek_ms, 0
+            self._seek_to(resume_at)
         if status == QMediaPlayer.EndOfMedia and self._current_episode is not None:
             self._podcasts.finished_playing(self._current_episode.id)
             self._current_episode = None
@@ -1191,6 +1280,10 @@ class MainWindow(QMainWindow):
 
     def _on_playback_state_changed(self, state) -> None:
         self._player_bar.set_playing(state == QMediaPlayer.PlayingState)
+        self._media.set_playing(
+            state == QMediaPlayer.PlayingState,
+            loaded=self._current is not None or self._current_episode is not None,
+        )
         if state != QMediaPlayer.PlayingState:
             self._save_episode_position()
 
@@ -1203,15 +1296,18 @@ class MainWindow(QMainWindow):
     def _on_volume_changed(self, volume: int) -> None:
         self._audio_output.setVolume(volume / 100)
         self._settings.set_volume(volume)
+        self._media.set_volume(volume)
 
     def _on_shuffle_toggled(self, shuffle: bool) -> None:
         self._queue.set_shuffle(shuffle)
         self._settings.set_shuffle(shuffle)
+        self._media.set_shuffle(shuffle)
         self._refresh_up_next()
 
     def _on_repeat_changed(self, repeat: str) -> None:
         self._queue.repeat = repeat
         self._settings.set_repeat(repeat)
+        self._media.set_repeat(repeat)
         self._refresh_up_next()
 
     # --- updates --------------------------------------------------------
@@ -1281,6 +1377,7 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._save_episode_position()
         self._podcasts.shutdown()
+        self._media.shutdown()
         self._album_model.shutdown()
         self._player.stop()
         for thread in list(self._background_threads):

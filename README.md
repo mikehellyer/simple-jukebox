@@ -74,6 +74,12 @@ one beside its Music folder. On an Android player such as a Sony Walkman,
 anything in that folder is listed under Podcasts rather than Music. Episodes
 copied earlier are removed from the device once they're played or deleted here.
 
+**Media keys and desktop controls.** On Linux, Simple-Jukebox speaks MPRIS, so
+your keyboard's play/pause/next/previous keys, the desktop's media controls
+(COSMIC/GNOME/KDE panel, lock screen) and `playerctl` control it even when its
+window isn't focused, and show the current song and album art. On Windows and
+macOS the media keys work while the app is focused.
+
 ## Development setup
 
 ```bash

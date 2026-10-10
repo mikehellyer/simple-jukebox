@@ -42,7 +42,8 @@ a = Analysis(
     datas=[
         (str(src / "simple_jukebox" / "gui" / "resources" / "icon.png"), "simple_jukebox/gui/resources"),
     ],
-    hiddenimports=["mutagen"],
+    # jeepney (Linux only) is imported lazily by core.mpris.
+    hiddenimports=["mutagen"] + (["jeepney.io.blocking", "jeepney.bus_messages"] if sys.platform.startswith("linux") else []),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

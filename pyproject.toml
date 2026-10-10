@@ -13,6 +13,7 @@ dependencies = [
     "platformdirs",
     "certifi",
     "mutagen",
+    "jeepney; sys_platform == 'linux'",  # MPRIS: desktop media keys/controls
 ]
 
 [project.scripts]
