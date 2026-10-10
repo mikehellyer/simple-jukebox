@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-from PySide6.QtCore import QItemSelectionModel, QObject, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QItemSelectionModel, QObject, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -56,6 +56,7 @@ from simple_jukebox.gui.source_list import KIND_LIBRARY, KIND_PLAYLIST, SourceLi
 from simple_jukebox.gui.track_model import COLUMNS, RATING_COLUMN, TrackTableModel
 from simple_jukebox.gui.up_next_panel import UpNextPanel
 from simple_jukebox.gui.update_banner import UpdateBanner
+from simple_jukebox.gui.workers import BackgroundRunner
 
 UPDATE_OWNER = "mikehellyer"
 UPDATE_REPO = "simple-jukebox"
@@ -78,19 +79,6 @@ ALL_ALBUMS = "All Albums"
 # same rule of thumb iTunes and Last.fm use — skipping after a few
 # seconds shouldn't bump its play count.
 PLAYED_FRACTION = 0.5
-
-
-class _CallableWorker(QObject):
-    """Runs a zero-arg callable on a background thread and emits its result."""
-
-    finished = Signal(object)
-
-    def __init__(self, fn):
-        super().__init__()
-        self._fn = fn
-
-    def run(self) -> None:
-        self.finished.emit(self._fn())
 
 
 class _ScanProgressBridge(QObject):
@@ -138,8 +126,7 @@ class MainWindow(QMainWindow):
         self._podcasts = PodcastManager(self._settings, parent=self)
         self._play_recorded = False
         self._scanning = False
-        self._background_threads: list[QThread] = []
-        self._background_workers: list[_CallableWorker] = []
+        self._background = BackgroundRunner(self)
         self._pending_update = None
         self._closing = False
 
@@ -447,27 +434,7 @@ class MainWindow(QMainWindow):
 
     def _run_in_background(self, fn, on_finished) -> None:
         """Run fn() off the GUI thread; on_finished(result) runs back on it."""
-        thread = QThread()
-        worker = _CallableWorker(fn)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        # Explicit QueuedConnection so on_finished always runs on the GUI
-        # thread, even when it's a plain lambda with no thread affinity.
-        worker.finished.connect(on_finished, Qt.QueuedConnection)
-        worker.finished.connect(thread.quit)
-
-        def _cleanup():
-            self._background_threads.remove(thread)
-            self._background_workers.remove(worker)
-
-        thread.finished.connect(_cleanup)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        # Both must stay referenced from self, or Python can collect them
-        # mid-flight.
-        self._background_threads.append(thread)
-        self._background_workers.append(worker)
-        thread.start()
+        self._background.run(fn, on_finished)
 
     # --- library folders & scanning -------------------------------------
 
@@ -1380,8 +1347,6 @@ class MainWindow(QMainWindow):
         self._media.shutdown()
         self._album_model.shutdown()
         self._player.stop()
-        for thread in list(self._background_threads):
-            thread.quit()
-            thread.wait(BACKGROUND_JOIN_TIMEOUT_MS)
+        self._background.shutdown(BACKGROUND_JOIN_TIMEOUT_MS)
         self._library.close()
         super().closeEvent(event)
