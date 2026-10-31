@@ -37,20 +37,40 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from simple_jukebox.core.device_identity import (
+    PODCASTS_BESIDE_MUSIC,
+    PODCASTS_CUSTOM,
+    PODCASTS_IN_MUSIC,
+    PODCASTS_SUBFOLDER,
+    DeviceCheck,
+    check_device,
+    default_podcast_location,
+    new_device_id,
+    podcast_folder,
+    read_identity,
+    write_identity,
+)
 from simple_jukebox.core.device_sync import (
     SyncPlan,
     candidate_device_folders,
-    default_podcast_folder_for,
     free_space,
     plan_file_sync,
     plan_sync,
+    read_manifest,
     run_sync,
+    tidy_abandoned_sync_folder,
 )
 from simple_jukebox.core.podcast_download import episode_relative_path
 from simple_jukebox.core.library import Library, Track
 from simple_jukebox.core.settings import DeviceProfile, SettingsStore
 
 NEW_DEVICE = "New device…"
+CONNECTED_SUFFIX = "  — connected"
+LOCATION_CHOICES = [
+    (PODCASTS_BESIDE_MUSIC, "The device's Podcasts folder (Android players, e.g. NW-A306)"),
+    (PODCASTS_IN_MUSIC, "Inside the Music folder (players that only read MUSIC, e.g. NW-A55)"),
+    (PODCASTS_CUSTOM, "Another folder…"),
+]
 
 
 def format_bytes(count: int) -> str:
@@ -88,6 +108,12 @@ class SyncDialog(QDialog):
         self._settings = settings
         self._run_in_background = run_in_background
         self._editing_name: Optional[str] = None  # name of the saved profile being edited
+        # Kept with the profile but not shown as fields:
+        self._device_id = ""  # matches the identity file on the device
+        self._last_podcast_dest = ""
+        self._location_auto = True  # podcast location follows the device type until chosen
+        self._podcast_custom = ""  # the folder for "Another folder…"
+        self._pending_podcast_dest = ""
         self._busy = False
         self._found_existing = 0  # from the last plan, for the "done" message
         self._cancel = threading.Event()
@@ -105,6 +131,9 @@ class SyncDialog(QDialog):
         self._remove_button.clicked.connect(self._forget_device)
         device_row.addWidget(self._remove_button)
         layout.addLayout(device_row)
+        self._device_status = QLabel("")
+        self._device_status.setWordWrap(True)
+        layout.addWidget(self._device_status)
 
         form = QFormLayout()
         self._name = QLineEdit()
@@ -114,7 +143,7 @@ class SyncDialog(QDialog):
         folder_row = QHBoxLayout()
         self._path = QLineEdit()
         self._path.setPlaceholderText("The Music folder on the player or its SD card")
-        self._path.textChanged.connect(self._update_summary)
+        self._path.textChanged.connect(lambda _text: self._on_music_path_changed())
         folder_row.addWidget(self._path, stretch=1)
         self._detected_button = QToolButton()
         self._detected_button.setText("Detected ▾")
@@ -194,19 +223,28 @@ class SyncDialog(QDialog):
         self._sync_podcasts = QCheckBox("Sync podcasts to the device")
         self._sync_podcasts.toggled.connect(self._on_mode_changed)
         podcasts.addWidget(self._sync_podcasts)
+        location_row = QHBoxLayout()
+        location_row.addWidget(QLabel("Where podcasts go:"))
+        self._podcast_location = QComboBox()
+        for value, label in LOCATION_CHOICES:
+            self._podcast_location.addItem(label, value)
+        self._podcast_location.currentIndexChanged.connect(self._on_location_chosen)
+        location_row.addWidget(self._podcast_location, stretch=1)
+        podcasts.addLayout(location_row)
         podcast_row = QHBoxLayout()
-        podcast_row.addWidget(QLabel("Podcasts folder:"))
+        podcast_row.addWidget(QLabel("Folder:"))
         self._podcast_path = QLineEdit()
-        self._podcast_path.setPlaceholderText("The Podcasts folder beside the device's Music folder")
+        self._podcast_path.setPlaceholderText("Choose the folder on the device")
         self._podcast_path.textChanged.connect(self._update_summary)
         podcast_row.addWidget(self._podcast_path, stretch=1)
-        podcast_browse = QPushButton("Browse…")
-        podcast_browse.clicked.connect(self._browse_podcasts)
-        podcast_row.addWidget(podcast_browse)
+        self._podcast_browse = QPushButton("Browse…")
+        self._podcast_browse.clicked.connect(self._browse_podcasts)
+        podcast_row.addWidget(self._podcast_browse)
         podcasts.addLayout(podcast_row)
         podcast_hint = QLabel(
-            "Episodes go into a folder per show, tagged as podcasts. On an Android player such as a "
-            "Walkman, anything in its Podcasts folder is listed under Podcasts rather than Music."
+            "Episodes go into a folder per show, tagged as podcasts. Android players (like the NW-A306) "
+            "list anything in their Podcasts folder under Podcasts. Sony's other players (like the NW-A55) "
+            "only read the MUSIC folder, so there the show appears as an album, with the genre Podcast."
         )
         podcast_hint.setWordWrap(True)
         podcast_hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -264,7 +302,7 @@ class SyncDialog(QDialog):
         layout.addLayout(buttons)
 
         self._populate_lists()
-        self._reload_devices()
+        self._reload_devices(select=self._connected_profile_name())
 
     # --- devices --------------------------------------------------------
 
@@ -273,19 +311,40 @@ class SyncDialog(QDialog):
         self._device_combo.blockSignals(True)
         self._device_combo.clear()
         for device in devices:
-            self._device_combo.addItem(device.name)
-        self._device_combo.addItem(NEW_DEVICE)
-        index = self._device_combo.findText(select) if select else 0
+            connected = device.device_id and check_device(Path(device.path), device.device_id).status == DeviceCheck.MATCH
+            self._device_combo.addItem(device.name + (CONNECTED_SUFFIX if connected else ""), device.name)
+        self._device_combo.addItem(NEW_DEVICE, None)
+        index = self._device_combo.findData(select) if select else 0
         self._device_combo.setCurrentIndex(max(0, index))
         self._device_combo.blockSignals(False)
         self._on_device_chosen()
 
+    def _connected_profile_name(self) -> Optional[str]:
+        """Which saved device is plugged in — found by its identity file,
+        at its usual folder or (if it now mounts somewhere else, as MTP
+        devices sometimes do) at any folder that looks like a player."""
+        devices = [d for d in self._settings.devices if d.device_id]
+        for device in devices:
+            if check_device(Path(device.path), device.device_id).status == DeviceCheck.MATCH:
+                return device.name
+        for folder in candidate_device_folders():
+            identity = read_identity(folder)
+            device = next((d for d in devices if identity and d.device_id == identity["id"]), None)
+            if device is not None:
+                device.path = str(folder)  # follow it to its new mount point
+                self._settings.save_device(device)
+                return device.name
+        return None
+
     def _profile_named(self, name: str) -> Optional[DeviceProfile]:
         return next((d for d in self._settings.devices if d.name == name), None)
 
+    def _profile_with_id(self, device_id: str) -> Optional[DeviceProfile]:
+        return next((d for d in self._settings.devices if device_id and d.device_id == device_id), None)
+
     def _on_device_chosen(self, *_args) -> None:
-        name = self._device_combo.currentText()
-        profile = self._profile_named(name) if name != NEW_DEVICE else None
+        name = self._device_combo.currentData()
+        profile = self._profile_named(name) if name else None
         self._editing_name = profile.name if profile else None
         self._remove_button.setEnabled(profile is not None)
         profile = profile or DeviceProfile(name="", path="", whole_library=False)
@@ -299,7 +358,11 @@ class SyncDialog(QDialog):
         self._find_existing.setChecked(profile.find_existing)
         self._sync_music.setChecked(profile.sync_music)
         self._sync_podcasts.setChecked(profile.sync_podcasts)
-        self._podcast_path.setText(profile.podcast_path)
+        self._device_id = profile.device_id
+        self._last_podcast_dest = profile.last_podcast_dest
+        self._podcast_custom = profile.podcast_path
+        self._location_auto = not profile.podcast_location
+        self._set_location(profile.podcast_location or default_podcast_location(profile.path))
         (self._all_podcasts if profile.all_podcasts else self._chosen_podcasts).setChecked(True)
         self._set_checked(self._podcast_list, set(profile.podcast_ids))
         self._unplayed_only.setChecked(profile.podcast_unplayed_only)
@@ -318,7 +381,10 @@ class SyncDialog(QDialog):
             find_existing=self._find_existing.isChecked(),
             sync_music=self._sync_music.isChecked(),
             sync_podcasts=self._sync_podcasts.isChecked(),
-            podcast_path=self._podcast_path.text().strip(),
+            podcast_path=self._podcast_custom,
+            podcast_location="" if self._location_auto else self._location(),
+            last_podcast_dest=self._last_podcast_dest,
+            device_id=self._device_id,
             all_podcasts=self._all_podcasts.isChecked(),
             podcast_ids=self._checked(self._podcast_list),
             podcast_unplayed_only=self._unplayed_only.isChecked(),
@@ -326,7 +392,7 @@ class SyncDialog(QDialog):
 
     def _save_profile(self) -> bool:
         profile = self._current_profile()
-        if not profile.name or not (profile.path or profile.podcast_path):
+        if not profile.name or not profile.path:
             return False
         self._settings.save_device(profile, old_name=self._editing_name)
         self._editing_name = profile.name
@@ -359,11 +425,44 @@ class SyncDialog(QDialog):
         start = self._podcast_folder() or self._path.text().strip() or str(Path.home())
         folder = QFileDialog.getExistingDirectory(self, "Podcasts Folder on the Device", start)
         if folder:
-            self._podcast_path.setText(folder)
+            self._podcast_custom = folder
+            self._show_podcast_folder()
+
+    # --- where podcasts go ----------------------------------------------
+
+    def _location(self) -> str:
+        return self._podcast_location.currentData() or PODCASTS_IN_MUSIC
+
+    def _set_location(self, location: str) -> None:
+        self._podcast_location.blockSignals(True)
+        self._podcast_location.setCurrentIndex(max(0, self._podcast_location.findData(location)))
+        self._podcast_location.blockSignals(False)
+        self._show_podcast_folder()
+
+    def _on_location_chosen(self, *_args) -> None:
+        self._location_auto = False
+        self._show_podcast_folder()
 
     def _podcast_folder(self) -> str:
-        """The chosen Podcasts folder, or the default one beside Music."""
-        return self._podcast_path.text().strip() or default_podcast_folder_for(self._path.text().strip())
+        return podcast_folder(self._path.text().strip(), self._location(), self._podcast_custom)
+
+    def _show_podcast_folder(self) -> None:
+        """The folder box shows where episodes will go; it's only editable
+        (by Browse…) for "Another folder"."""
+        custom = self._location() == PODCASTS_CUSTOM
+        self._podcast_path.blockSignals(True)
+        self._podcast_path.setText(self._podcast_folder())
+        self._podcast_path.blockSignals(False)
+        self._podcast_path.setReadOnly(True)
+        self._podcast_browse.setVisible(custom)
+        self._update_summary()
+
+    def _on_music_path_changed(self) -> None:
+        # Until a location is chosen by hand, follow what kind of player it is.
+        if self._location_auto:
+            self._set_location(default_podcast_location(self._path.text().strip()))
+        else:
+            self._show_podcast_folder()
 
     def _browse(self) -> None:
         start = self._path.text().strip() or str(Path.home())
@@ -424,7 +523,8 @@ class SyncDialog(QDialog):
         self._playlist_list.setEnabled(chosen)
         self._artist_list.setEnabled(chosen)
         podcasts = self._sync_podcasts.isChecked()
-        for widget in (self._podcast_path, self._all_podcasts, self._chosen_podcasts, self._unplayed_only):
+        for widget in (self._podcast_location, self._podcast_path, self._podcast_browse, self._all_podcasts,
+                       self._chosen_podcasts, self._unplayed_only):
             widget.setEnabled(podcasts)
         self._podcast_list.setEnabled(podcasts and self._chosen_podcasts.isChecked())
         self._update_summary()
@@ -483,6 +583,28 @@ class SyncDialog(QDialog):
         elif path:
             text += "  That folder can't be found — is the device plugged in?"
         self._summary.setText(text)
+        self._update_device_status()
+
+    def _update_device_status(self) -> None:
+        if not hasattr(self, "_device_status"):
+            return
+        path, name = self._path.text().strip(), self._name.text().strip() or "this device"
+        if not path:
+            self._device_status.setText("")
+            return
+        result = check_device(Path(path), self._device_id)
+        text, colour = {
+            DeviceCheck.MATCH: (f"✓ Connected — this is “{name}”.", "#2e8b57"),
+            DeviceCheck.NEW: (f"New device — it will be marked as “{name}” on its first sync.", "gray"),
+            DeviceCheck.OTHER: (
+                f"⚠ A different device is connected here: “{result.found_name or 'another device'}”. "
+                f"Plug in “{name}” to sync it.", "#c0392b"),
+            DeviceCheck.UNMARKED: (
+                f"⚠ The device here isn't marked as “{name}” — is the right one plugged in?", "#d35400"),
+            DeviceCheck.NOT_FOUND: (f"“{name}” isn't connected.", "gray"),
+        }[result.status]
+        self._device_status.setText(text)
+        self._device_status.setStyleSheet(f"color: {colour};")
 
     # --- syncing --------------------------------------------------------
 
@@ -492,6 +614,7 @@ class SyncDialog(QDialog):
             self._device_combo, self._remove_button, self._name, self._path, self._detected_button,
             self._whole_library, self._chosen, self._copy_playlists, self._remove_unselected,
             self._find_existing, self._sync_music, self._sync_podcasts, self._podcast_path,
+            self._podcast_location, self._podcast_browse,
             self._all_podcasts, self._chosen_podcasts, self._unplayed_only, self._podcast_list,
             self._playlist_list, self._artist_list,
             self._sync_button, self._close_button,
@@ -515,8 +638,11 @@ class SyncDialog(QDialog):
             "(or its card is in the reader)."
         )
         dest = Path(profile.path) if profile.path else None
-        if profile.sync_music and (dest is None or not dest.is_dir()):
+        if dest is None or not dest.is_dir():
+            # Needed even for podcasts only: it's where the device's identity lives.
             QMessageBox.warning(self, "Sync to Device", f"The Music folder {not_found}")
+            return
+        if not self._confirm_right_device(profile, dest):
             return
         podcast_dest = None
         if profile.sync_podcasts:
@@ -530,6 +656,8 @@ class SyncDialog(QDialog):
                 QMessageBox.warning(self, "Sync to Device", f"The Podcasts folder {not_found}")
                 return
         self._save_profile()
+        old_podcast_folders = self._old_podcast_folders(profile, podcast_dest) if profile.sync_podcasts else []
+        skip = [PODCASTS_SUBFOLDER] if podcast_dest is not None and podcast_dest.parent == dest else []
         tracks, playlists = self._selection() if profile.sync_music else ([], {})
         items = self._podcast_items()
         if profile.sync_music and not tracks and not profile.remove_unselected and not items:
@@ -549,12 +677,68 @@ class SyncDialog(QDialog):
                 plan_sync(
                     dest, tracks, playlists,
                     remove_unselected=remove, find_existing=find_existing,
-                    progress=bridge.progress.emit, tag_cache_path=cache_path,
+                    progress=bridge.progress.emit, tag_cache_path=cache_path, skip_folders=skip,
                 ) if sync_music else None,
                 plan_file_sync(podcast_dest, items) if podcast_dest is not None else None,
+                [plan_file_sync(folder, []) for folder in old_podcast_folders],
             ),
             self._on_planned,
         )
+        self._pending_podcast_dest = str(podcast_dest) if podcast_dest is not None else self._last_podcast_dest
+
+    def _confirm_right_device(self, profile: DeviceProfile, dest: Path) -> bool:
+        """Refuse to sync onto the wrong player. Two Walkmans can mount at
+        the same place, so the identity file decides, not the folder."""
+        result = check_device(dest, profile.device_id)
+        if result.status in (DeviceCheck.MATCH, DeviceCheck.NEW):
+            return True
+        if result.status == DeviceCheck.OTHER:
+            other = self._profile_with_id(result.found_id)
+            if other is None and not profile.device_id:
+                # Marked by a device profile that has since been forgotten.
+                answer = QMessageBox.question(
+                    self,
+                    "Use This Device?",
+                    f"This device was set up as “{result.found_name or 'another device'}”, which isn't one of "
+                    f"your saved devices any more.\n\nUse it as “{profile.name}”?",
+                )
+                if answer == QMessageBox.Yes:
+                    self._device_id = result.found_id
+                    return True
+                return False
+            found = other.name if other is not None else (result.found_name or "another device")
+            QMessageBox.warning(
+                self,
+                "Wrong Device",
+                f"The device connected here is “{found}”, not “{profile.name}”.\n\n"
+                f"Nothing was synced. Plug in “{profile.name}”"
+                + (f", or choose “{found}” above to sync that one." if other is not None else "."),
+            )
+            if other is not None:
+                self._reload_devices(select=other.name)
+            return False
+        # UNMARKED: a known device, but this folder has no identity.
+        answer = QMessageBox.question(
+            self,
+            "Is This the Right Device?",
+            f"The device at this folder isn't marked as “{profile.name}” — it has never been synced as that "
+            "device. If you've reset the player or swapped its card, it's fine to carry on.\n\n"
+            f"Is this “{profile.name}”?",
+        )
+        return answer == QMessageBox.Yes
+
+    def _old_podcast_folders(self, profile: DeviceProfile, podcast_dest: Optional[Path]) -> list[Path]:
+        """Where episodes were synced before, if podcasts now go elsewhere
+        — so the copies left there can be cleared away."""
+        music = profile.path
+        candidates = {profile.last_podcast_dest} | {
+            podcast_folder(music, location) for location in (PODCASTS_BESIDE_MUSIC, PODCASTS_IN_MUSIC)
+        }
+        current = str(podcast_dest) if podcast_dest is not None else ""
+        return [
+            Path(folder) for folder in sorted(c for c in candidates if c and c != current)
+            if Path(folder).is_dir() and read_manifest(Path(folder))
+        ]
 
     @staticmethod
     def _tag_cache_path(dest: Path) -> Path:
@@ -564,8 +748,9 @@ class SyncDialog(QDialog):
         return Path(user_cache_dir("Simple-Jukebox")) / "device-tags" / f"{key}.json"
 
     def _on_planned(self, plans) -> None:
-        music_plan, podcast_plan = plans
-        active = [plan for plan in plans if plan is not None]
+        music_plan, podcast_plan, old_podcast_plans = plans
+        old_podcast_plans = [p for p in old_podcast_plans if p.deletes]
+        active = [plan for plan in (music_plan, podcast_plan) if plan is not None] + old_podcast_plans
         free = next((f for f in (free_space(p.dest) for p in active) if f is not None), None)
         needed = sum(p.bytes_to_copy - p.bytes_to_free for p in active)
         if free is not None and needed > free:
@@ -581,6 +766,7 @@ class SyncDialog(QDialog):
         nothing_to_do = all(not p.copies and not p.all_deletes and not p.playlists for p in active)
         if nothing_to_do:
             self._set_busy(False)
+            self._mark_synced()
             parts = []
             if music_plan is not None:
                 parts.append(songs(music_plan.song_count))
@@ -601,6 +787,10 @@ class SyncDialog(QDialog):
                 f"• {episodes(len(podcast_plan.deletes))} copied earlier — since played, deleted "
                 "or no longer selected."
             )
+        for old in old_podcast_plans:
+            reasons.append(
+                f"• {episodes(len(old.deletes))} copied earlier to {old.dest}, where podcasts no longer go."
+            )
         if reasons:
             freed = sum(p.bytes_to_free for p in active)
             answer = QMessageBox.question(
@@ -615,6 +805,7 @@ class SyncDialog(QDialog):
                 self._status.setText("Sync cancelled.")
                 return
 
+        self._mark_synced()  # the device is about to be written to: make sure it carries its identity
         copying = []
         if music_plan is not None and music_plan.copies:
             copying.append(songs(len(music_plan.copies)))
@@ -625,13 +816,40 @@ class SyncDialog(QDialog):
         )
         self._found_existing = music_plan.found_existing if music_plan is not None else 0
         bridge, cancel = self._bridge, self._cancel
-        self._run_in_background(
-            lambda: tuple(
+
+        def work():
+            results = tuple(
                 run_sync(plan, progress=bridge.progress.emit, cancelled=cancel.is_set) if plan is not None else None
                 for plan in (music_plan, podcast_plan)
-            ),
-            self._on_synced,
-        )
+            )
+            cleared = [run_sync(plan, cancelled=cancel.is_set) for plan in old_podcast_plans]
+            for plan in old_podcast_plans:
+                tidy_abandoned_sync_folder(plan.dest)
+            return results + (cleared,)
+
+        self._run_in_background(work, self._on_synced)
+
+    def _mark_synced(self) -> None:
+        """Write the device's identity (first sync) and remember where its
+        podcasts now go."""
+        profile = self._current_profile()
+        if not self._device_id:
+            self._device_id = new_device_id()
+        identity = read_identity(Path(profile.path))
+        if identity is None or identity.get("id") != self._device_id or identity.get("name") != profile.name:
+            try:
+                write_identity(Path(profile.path), self._device_id, profile.name)
+            except OSError:
+                pass  # a read-only card still syncs; it just can't be recognised later
+        self._last_podcast_dest = self._pending_podcast_dest or self._last_podcast_dest
+        self._location_auto = False  # settled now: keep it even if the device type is guessed differently later
+        # Save without reloading the device list — that would reset the
+        # window mid-sync.
+        profile = self._current_profile()
+        if profile.name and profile.path:
+            self._settings.save_device(profile, old_name=self._editing_name)
+            self._editing_name = profile.name
+        self._update_device_status()
 
     def _on_progress(self, done: int, total: int, label: str) -> None:
         self._progress.setRange(0, max(1, total))
@@ -641,8 +859,8 @@ class SyncDialog(QDialog):
 
     def _on_synced(self, results) -> None:
         self._set_busy(False)
-        music, podcasts = results
-        done = [r for r in results if r is not None]
+        music, podcasts, cleared = results
+        done = [r for r in (music, podcasts) if r is not None] + list(cleared)
         copied = []
         if music is not None and music.copied:
             copied.append(songs(music.copied))

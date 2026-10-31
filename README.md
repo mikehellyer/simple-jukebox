@@ -69,10 +69,20 @@ any duplicate an earlier sync made is removed (your copy is kept).
 Each device's choices are remembered for next time.
 
 The **Podcasts** tab syncs downloaded episodes (all shows or chosen ones,
-optionally only unplayed) into the device's **Podcasts** folder — by default the
-one beside its Music folder. On an Android player such as a Sony Walkman,
-anything in that folder is listed under Podcasts rather than Music. Episodes
+optionally only unplayed). **Where podcasts go** depends on the player:
+Android players (e.g. the Walkman NW-A306) list anything in the **Podcasts**
+folder beside Music under Podcasts; Sony's other players (e.g. the NW-A55) only
+read the MUSIC folder, so episodes go in `MUSIC/Podcasts/<Show>/` and the show
+appears as an album with the genre Podcast. The right choice is picked
+automatically (Android storage has an `Android` folder) and can be changed;
+if it changes, episodes copied to the old place are cleared away. Episodes
 copied earlier are removed from the device once they're played or deleted here.
+
+**Which device is connected.** On its first sync each device gets a small
+identity file in its Music folder. Opening Sync to Device selects whichever
+saved device is plugged in (marked "connected"), and a sync is refused if a
+different device is in its place — two Walkmans can mount at the same
+`WALKMAN` path, so the identity file decides, not the folder.
 
 **Media keys and desktop controls.** On Linux, Simple-Jukebox speaks MPRIS, so
 your keyboard's play/pause/next/previous keys, the desktop's media controls

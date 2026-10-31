@@ -143,11 +143,16 @@ class _DeviceSong:
     duration: float = 0.0
 
 
-def _device_songs(dest: Path, exclude: set[str]) -> list[_DeviceSong]:
-    """Audio files under dest that this app didn't put there."""
+def _device_songs(dest: Path, exclude: set[str], skip_folders: Iterable[str] = ()) -> list[_DeviceSong]:
+    """Audio files under dest that this app didn't put there (ignoring
+    skip_folders at the top level — e.g. podcasts kept inside Music)."""
     songs = []
+    skip = {name.lower() for name in skip_folders}
     for dirpath, dirnames, filenames in os.walk(dest):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        at_top = Path(dirpath) == Path(dest)
+        dirnames[:] = [
+            d for d in dirnames if not d.startswith(".") and not (at_top and d.lower() in skip)
+        ]
         for name in filenames:
             if Path(name).suffix.lower() not in _AUDIO_EXTENSIONS:
                 continue
@@ -289,6 +294,7 @@ def plan_sync(
     tag_reader: Optional[Callable] = None,
     progress: Optional[Callable[[int, int, str], None]] = None,
     tag_cache_path: Optional[Path] = None,
+    skip_folders: Iterable[str] = (),
 ) -> SyncPlan:
     """Work out what to copy and delete, without changing the device.
 
@@ -306,7 +312,7 @@ def plan_sync(
         if tag_reader is None:
             from simple_jukebox.core.tags import read_track as tag_reader
         existing = _ExistingSongs(
-            dest, _device_songs(dest, previously_synced), tag_reader, progress, tag_cache_path
+            dest, _device_songs(dest, previously_synced, skip_folders), tag_reader, progress, tag_cache_path
         )
 
     seen: set[str] = set()  # our device paths of selected songs
@@ -419,6 +425,21 @@ def plan_file_sync(dest: Path, items: Iterable[tuple[str, str]], remove_unselect
             except OSError:
                 pass
     return plan
+
+
+def tidy_abandoned_sync_folder(dest: Path) -> bool:
+    """After clearing a sync folder that's no longer used (e.g. podcasts
+    now go elsewhere): remove its empty manifest, then the folder itself
+    if nothing else is in it. True if the folder is gone."""
+    dest = Path(dest)
+    if read_manifest(dest):
+        return False  # something we copied is still there
+    try:
+        (dest / MANIFEST_NAME).unlink(missing_ok=True)
+        dest.rmdir()  # only succeeds if empty — the user's own files keep it
+    except OSError:
+        return False
+    return True
 
 
 def default_podcast_folder_for(music_folder: str) -> str:

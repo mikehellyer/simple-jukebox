@@ -28,7 +28,10 @@ class DeviceProfile:
     remove_unselected: bool = True
     find_existing: bool = True  # skip songs already on the device under another name
     sync_podcasts: bool = False
-    podcast_path: str = ""  # the device's Podcasts folder
+    podcast_path: str = ""  # custom Podcasts folder (podcast_location "custom")
+    podcast_location: str = ""  # "beside" / "inside" Music, or "custom"; "" = decide from the device
+    last_podcast_dest: str = ""  # where episodes were last synced, to tidy up if that changes
+    device_id: str = ""  # matches the identity file on the device; "" until its first sync
     all_podcasts: bool = True
     podcast_ids: list[int] = field(default_factory=list)
     podcast_unplayed_only: bool = True
@@ -52,7 +55,18 @@ class DeviceProfile:
             all_podcasts=bool(data.get("all_podcasts", True)),
             podcast_ids=[i for i in data.get("podcast_ids", []) if isinstance(i, int)],
             podcast_unplayed_only=bool(data.get("podcast_unplayed_only", True)),
+            podcast_location=cls._podcast_location(data),
+            last_podcast_dest=data["last_podcast_dest"] if isinstance(data.get("last_podcast_dest"), str) else "",
+            device_id=data["device_id"] if isinstance(data.get("device_id"), str) else "",
         )
+
+    @staticmethod
+    def _podcast_location(data: dict) -> str:
+        location = data.get("podcast_location")
+        if location in ("beside", "inside", "custom"):
+            return location
+        # Saved before locations existed: a typed-in folder was a custom one.
+        return "custom" if data.get("podcast_path") else ""
 
 
 @dataclass

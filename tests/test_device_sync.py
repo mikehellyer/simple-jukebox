@@ -302,3 +302,40 @@ def test_default_podcast_folder_sits_beside_music(tmp_path):
     (music.parent / "PODCASTS").mkdir()
     assert default_podcast_folder_for(str(music)) == str(music.parent / "PODCASTS")
     assert default_podcast_folder_for("") == ""
+
+
+def test_podcasts_kept_inside_music_are_not_mistaken_for_songs(tmp_path):
+    dest = tmp_path / "MUSIC"
+    _users_file(dest, "Podcasts/Retro Hour/2026-10-08 A.mp3")
+    read = []
+
+    def tags(path):
+        read.append(Path(path).name)
+        return TrackInfo(path=str(path), title="A", artist="Band", album="Record", album_artist="Band", duration=200)
+
+    track = _track(tmp_path, 1, "A")
+    plan = plan_sync(dest, [track], tag_reader=tags, skip_folders=["Podcasts"])
+    assert read == [] and plan.found_existing == 0 and len(plan.copies) == 1
+
+
+def test_old_podcast_folder_is_cleared_and_tidied(tmp_path):
+    from simple_jukebox.core.device_sync import plan_file_sync, tidy_abandoned_sync_folder
+
+    old = tmp_path / "WALKMAN" / "Podcasts"
+    old.mkdir(parents=True)
+    episode = tmp_path / "ep.mp3"
+    episode.write_bytes(b"e")
+    run_sync(plan_file_sync(old, [(str(episode), "Show/2026-10-08 Ep.mp3")]))
+
+    clear = plan_file_sync(old, [])  # nothing wanted there any more
+    assert clear.deletes == ["Show/2026-10-08 Ep.mp3"]
+    run_sync(clear)
+    assert tidy_abandoned_sync_folder(old)
+    assert not old.exists()
+
+    # A folder with the user's own files in it is left alone.
+    kept = tmp_path / "card" / "Podcasts"
+    (kept / "Mine").mkdir(parents=True)
+    (kept / "Mine" / "theirs.mp3").write_bytes(b"x")
+    assert not tidy_abandoned_sync_folder(kept)
+    assert (kept / "Mine" / "theirs.mp3").exists()
