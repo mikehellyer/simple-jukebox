@@ -10,7 +10,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Linux is pinned, not ubuntu-latest: the app bundles the build
+        # machine's libraries, so it only runs on systems at least as new.
+        # 24.04 matches Pop!_OS 24.04.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +29,10 @@ jobs:
 
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm packaging/pyinstaller/simple-jukebox.spec
+
+      - name: Check it runs on Ubuntu / Pop!_OS 24.04
+        if: runner.os == 'Linux'
+        run: bash packaging/linux/check-glibc.sh dist/Simple-Jukebox 2.39
 
       - name: Package (.deb)
         if: runner.os == 'Linux'
